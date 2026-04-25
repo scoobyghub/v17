@@ -15,8 +15,8 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
-// @updateURL    https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.meta.js
-// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.user.js
+// @updateURL    https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.meta.js
+// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.user.js
 // ==/UserScript==
 
 
