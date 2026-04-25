@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.02
+// @name         TMN TDS Auto v17.03
 // @namespace    http://tampermonkey.net/
-// @version      17.02
-// @description  v17.02 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.03
+// @description  v17.03 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -245,7 +245,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.02\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.03\n${message}`;
     }
 
     function clearTimers() {
@@ -595,7 +595,8 @@ if (currentPath.includes("/authenticated/")) {
     ocTeamTransporter: GM_getValue('ocTeamTransporter', ''),
     ocTeamWeaponMaster: GM_getValue('ocTeamWeaponMaster', ''),
     ocTeamExplosive: GM_getValue('ocTeamExplosive', ''),
-    ocScheduledTime: GM_getValue('ocScheduledTime', '')
+    ocScheduledTime: GM_getValue('ocScheduledTime', ''),
+    ocType: GM_getValue('ocType', 'Casino')
   };
 
   let automationPaused = false;
@@ -639,6 +640,7 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('ocTeamWeaponMaster', state.ocTeamWeaponMaster);
     GM_setValue('ocTeamExplosive', state.ocTeamExplosive);
     GM_setValue('ocScheduledTime', state.ocScheduledTime);
+    GM_setValue('ocType', state.ocType);
   }
 
   // ---------------------------
@@ -4818,23 +4820,36 @@ let logoutNotificationSent = false;
         return true;
       }
 
-      // STEP 0: Click start button (Armoury first, fall back to Bank)
+      // STEP 0: Click start button based on user's OC type preference
       if (step === 0) {
+        const casinoBtn = document.getElementById('ctl00_main_btnStartOCRobCasino');
         const armouryBtn = document.getElementById('ctl00_main_btnStartOCRobArmoury');
         const bankBtn = document.getElementById('ctl00_main_btnStartOCRobBank');
-        const startBtn = (armouryBtn && !armouryBtn.disabled) ? armouryBtn
-                       : (bankBtn && !bankBtn.disabled) ? bankBtn
-                       : null;
+
+        // Build preference order based on user's selection
+        let preferred;
+        const pref = (state.ocType || 'Casino').toLowerCase();
+        if (pref === 'casino') {
+          preferred = [casinoBtn, armouryBtn, bankBtn];
+        } else if (pref === 'armoury') {
+          preferred = [armouryBtn, casinoBtn, bankBtn];
+        } else {
+          preferred = [bankBtn, casinoBtn, armouryBtn];
+        }
+
+        const startBtn = preferred.find(btn => btn && !btn.disabled) || null;
         if (!startBtn) {
           console.log('[TMN][CreateOC] No enabled start button found — retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return false;
         }
-        console.log('[TMN][CreateOC] Step 0: Starting OC — ' + startBtn.id);
+        const typeName = startBtn.id.includes('Casino') ? 'Casino'
+                       : startBtn.id.includes('Armoury') ? 'Armoury' : 'Bank';
+        console.log(`[TMN][CreateOC] Step 0: Starting OC — ${typeName}`);
         await humanDelay(randomDelay(DELAYS.normal));
         sendTelegramMessage(
           `🏢 <b>OC Step 1/5</b>\n\nLeader: ${username}\n` +
-          `Started OC (${startBtn.id.includes('Armoury') ? 'Armoury' : 'Bank'})`
+          `Started OC (${typeName})`
         );
         localStorage.setItem(LS_CREATE_OC_STATE, 'setup');
         localStorage.setItem(LS_CREATE_OC_STEP, '1');
@@ -5063,7 +5078,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.02</strong>
+          <strong>TMN TDS Auto v17.03</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -5464,6 +5479,15 @@ let logoutNotificationSent = false;
             <div class="modal-body" style="padding: 10px 12px;">
               <small class="text-muted d-block mb-2">Team members for auto OC creation. You are the Leader.</small>
 
+              <div style="margin-bottom: 8px;">
+                <label style="color:#9ca3af; font-size: 0.85rem;">OC Type:</label>
+                <select id="tmn-oc-type" style="background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:4px; padding:3px 6px; font-size:0.85rem; margin-left: 6px;">
+                  <option value="Casino" ${state.ocType === 'Casino' ? 'selected' : ''}>Casino (best XP)</option>
+                  <option value="Armoury" ${state.ocType === 'Armoury' ? 'selected' : ''}>Armoury (best bullets)</option>
+                  <option value="Bank" ${state.ocType === 'Bank' ? 'selected' : ''}>Bank</option>
+                </select>
+              </div>
+
               <div style="display: grid; grid-template-columns: auto 1fr; gap: 6px 10px; align-items: center; font-size: 0.85rem;">
                 <label style="color:#9ca3af;">Transporter:</label>
                 <input type="text" id="tmn-oc-team-transporter" style="background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:4px; padding:3px 6px; font-size:0.85rem;" value="${state.ocTeamTransporter}" placeholder="Username">
@@ -5725,6 +5749,16 @@ let logoutNotificationSent = false;
       ocModal.setAttribute('aria-hidden', 'true');
       ocBackdrop.style.display = 'none';
     });
+
+    // OC Type selector
+    const ocTypeSelect = shadowRoot.querySelector('#tmn-oc-type');
+    if (ocTypeSelect) {
+      ocTypeSelect.addEventListener('change', () => {
+        state.ocType = ocTypeSelect.value;
+        saveState();
+        updateStatus(`OC type: ${state.ocType}`);
+      });
+    }
 
     // OC Team name inputs — save on blur
     const teamTransInput = shadowRoot.querySelector('#tmn-oc-team-transporter');
@@ -6811,7 +6845,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.02 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.03 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
