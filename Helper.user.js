@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.03
+// @name         TMN TDS Auto v17.04
 // @namespace    http://tampermonkey.net/
-// @version      17.03
-// @description  v17.03 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.04
+// @description  v17.04 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -15,8 +15,8 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
-// @updateURL    https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.meta.js
-// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.user.js
+// @updateURL    https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.meta.js
+// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.user.js
 // ==/UserScript==
 
 
@@ -245,7 +245,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.03\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.04\n${message}`;
     }
 
     function clearTimers() {
@@ -4565,17 +4565,57 @@ let logoutNotificationSent = false;
   function scrapeHotCityFromDOM(doc) {
     if (!doc) return null;
     try {
-      for (const span of doc.querySelectorAll('span[style]')) {
-        if (/color\s*:\s*#990000/i.test(span.getAttribute('style') || '')) {
-          if (!span.textContent.trim()) continue;
+      // The statistics page uses mat-inline-symbol spans with #990000 color for each city.
+      // The HOT city is identified by the icon text "Swords" (Material icon name) in the
+      // #990000 span. The city name is in the next sibling span element.
+      // Structure: <span class="mat-inline-symbol" style="...#990000...">Swords</span>
+      //            <span>Toronto</span>
+      //            followed by text containing ": Hot city, There is less..."
+      //
+      // Alternative approach: look for any text node containing "Hot city" and work
+      // backwards to find the city name. This is more resilient to layout changes.
+
+      // Approach 1: Find "Swords" icon span → next sibling is the city name
+      for (const span of doc.querySelectorAll('span.mat-inline-symbol')) {
+        const style = span.getAttribute('style') || '';
+        if (!/990000/.test(style)) continue;
+        const iconText = span.textContent.trim();
+        if (iconText === 'Swords') {
           const next = span.nextElementSibling;
           if (next) {
             const city = next.textContent.trim();
-            if (city) return city;
+            if (city && city.length < 30) {
+              console.log(`[TMN][HotCity] Found hot city via Swords icon: "${city}"`);
+              return city;
+            }
           }
         }
       }
-    } catch {}
+
+      // Approach 2: Fallback — search for "Hot city" text in any element
+      const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null, false);
+      while (walker.nextNode()) {
+        const text = walker.currentNode.textContent;
+        if (/hot\s*city/i.test(text)) {
+          // Walk up to find a city name — usually in a nearby span
+          const parent = walker.currentNode.parentElement;
+          if (parent) {
+            const prev = parent.previousElementSibling;
+            if (prev) {
+              const city = prev.textContent.trim();
+              if (city && city.length < 30 && !/Swords|local_police/i.test(city)) {
+                console.log(`[TMN][HotCity] Found hot city via "Hot city" text: "${city}"`);
+                return city;
+              }
+            }
+          }
+        }
+      }
+
+      console.log('[TMN][HotCity] Could not identify hot city from DOM');
+    } catch (e) {
+      console.warn('[TMN][HotCity] scrapeHotCityFromDOM error:', e);
+    }
     return null;
   }
 
@@ -4597,13 +4637,13 @@ let logoutNotificationSent = false;
 
   function isInHotCity() {
     const hotCity = getHotCity();
-    if (!hotCity) return true; // No cached city → allow (will scrape on next trigger)
+    if (!hotCity) return false; // No cached city → don't allow (need to scrape first)
     try {
       const el = document.getElementById('ctl00_userInfo_lblcity');
       const currentCity = (el ? el.textContent : '').trim();
       return currentCity.toLowerCase().includes(hotCity.toLowerCase()) ||
              hotCity.toLowerCase().includes(currentCity.toLowerCase());
-    } catch { return true; }
+    } catch { return false; }
   }
 
   function getCurrentCity() {
@@ -4699,6 +4739,13 @@ let logoutNotificationSent = false;
     const retryAfter = parseInt(localStorage.getItem(LS_CREATE_OC_RETRY_AFTER) || '0', 10);
     if (retryAfter && Date.now() < retryAfter) {
       console.log(`[TMN][CreateOC] Retry suppressed — ${Math.ceil((retryAfter - Date.now()) / 1000)}s remaining`);
+      return;
+    }
+
+    // Ensure we know the hot city
+    if (!getHotCity()) {
+      console.log('[TMN][CreateOC] Hot city not cached — fetching before proceeding');
+      fetchHotCity();
       return;
     }
 
@@ -5078,7 +5125,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.03</strong>
+          <strong>TMN TDS Auto v17.04</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -6845,7 +6892,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.03 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.04 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
