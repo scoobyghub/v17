@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.04
+// @name         TMN TDS Auto v17.05
 // @namespace    http://tampermonkey.net/
-// @version      17.04
-// @description  v17.04 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.05
+// @description  v17.05 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -15,8 +15,8 @@
 // @grant        GM_addStyle
 // @grant        GM_xmlhttpRequest
 // @connect      api.telegram.org
-// @updateURL    https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.meta.js
-// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.user.js
+// @updateURL    https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.meta.js
+// @downloadURL  https://raw.githubusercontent.com/scoobyghub/v16/refs/heads/main/Helper.user.js
 // ==/UserScript==
 
 
@@ -245,7 +245,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.04\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.05\n${message}`;
     }
 
     function clearTimers() {
@@ -596,7 +596,9 @@ if (currentPath.includes("/authenticated/")) {
     ocTeamWeaponMaster: GM_getValue('ocTeamWeaponMaster', ''),
     ocTeamExplosive: GM_getValue('ocTeamExplosive', ''),
     ocScheduledTime: GM_getValue('ocScheduledTime', ''),
-    ocType: GM_getValue('ocType', 'Casino')
+    ocType: GM_getValue('ocType', 'Casino'),
+    ocRepeatMode: GM_getValue('ocRepeatMode', 'once'),
+    ocRepeatsLeft: GM_getValue('ocRepeatsLeft', 0)
   };
 
   let automationPaused = false;
@@ -641,6 +643,8 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('ocTeamExplosive', state.ocTeamExplosive);
     GM_setValue('ocScheduledTime', state.ocScheduledTime);
     GM_setValue('ocType', state.ocType);
+    GM_setValue('ocRepeatMode', state.ocRepeatMode);
+    GM_setValue('ocRepeatsLeft', state.ocRepeatsLeft);
   }
 
   // ---------------------------
@@ -4851,12 +4855,58 @@ let logoutNotificationSent = false;
           console.log('[TMN][CreateOC] Polling: Commit button ready — submitting!');
           await humanDelay(randomDelay(DELAYS.normal));
           formSubmitButton(commitBtn);
+
+          // Determine whether to continue or stop based on repeat mode
+          const mode = state.ocRepeatMode || 'once';
+          let willRepeat = false;
+          let statusMsg = 'Cooldown started';
+
+          if (mode === 'continuous') {
+            willRepeat = true;
+            statusMsg = 'Cooldown started — will create again when ready (continuous)';
+          } else if (mode === 'once') {
+            willRepeat = false;
+            statusMsg = 'Cooldown started — one-off complete, Create OC disabled';
+          } else {
+            // repeat_1, repeat_2, repeat_3
+            const left = (state.ocRepeatsLeft || 0) - 1;
+            if (left > 0) {
+              state.ocRepeatsLeft = left;
+              willRepeat = true;
+              statusMsg = `Cooldown started — ${left} repeat(s) remaining`;
+            } else {
+              willRepeat = false;
+              statusMsg = 'Cooldown started — all repeats done, Create OC disabled';
+            }
+          }
+
           sendTelegramMessage(
             '✅ <b>OC Committed!</b>\n\n' +
             `Leader: ${username}\n` +
-            'Cooldown started'
+            statusMsg
           );
+
           resetCreateOC();
+
+          if (!willRepeat) {
+            // Turn off Create OC — one-off or all repeats used
+            state.createOC = false;
+            state.ocScheduledTime = '';
+            state.ocRepeatsLeft = 0;
+            saveState();
+            // Update UI if open
+            try {
+              const host = document.getElementById('tmn-automation-host');
+              if (host && host.shadowRoot) {
+                const cb = host.shadowRoot.querySelector('#tmn-create-oc');
+                if (cb) cb.checked = false;
+              }
+            } catch (e) {}
+            console.log('[TMN][CreateOC] Create OC disabled — schedule complete');
+          } else {
+            saveState();
+            console.log(`[TMN][CreateOC] Will repeat — mode=${mode}, repeatsLeft=${state.ocRepeatsLeft}`);
+          }
           return true;
         }
         // Not ready yet — check back in 60s
@@ -5125,7 +5175,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.04</strong>
+          <strong>TMN TDS Auto v17.05</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -5548,6 +5598,17 @@ let logoutNotificationSent = false;
                 <small class="text-muted d-block mb-1">Schedule OC creation:</small>
                 <input type="datetime-local" id="tmn-oc-schedule-time" style="background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:4px; padding:3px 6px; font-size:0.85rem; width:100%; color-scheme: dark;" value="${state.ocScheduledTime || ''}">
                 <small class="text-muted d-block mt-1">OC will trigger when this time arrives AND cooldown is expired. Leave blank to trigger on cooldown only.</small>
+
+                <div class="mt-2">
+                  <label style="color:#9ca3af; font-size: 0.85rem;">Repeat:</label>
+                  <select id="tmn-oc-repeat-mode" style="background:#0b1220; color:#e5e7eb; border:1px solid #334155; border-radius:4px; padding:3px 6px; font-size:0.85rem; margin-left: 6px;">
+                    <option value="once" ${state.ocRepeatMode === 'once' ? 'selected' : ''}>Once (then stop)</option>
+                    <option value="repeat_1" ${state.ocRepeatMode === 'repeat_1' ? 'selected' : ''}>+ 1 repeat (2 total)</option>
+                    <option value="repeat_2" ${state.ocRepeatMode === 'repeat_2' ? 'selected' : ''}>+ 2 repeats (3 total)</option>
+                    <option value="repeat_3" ${state.ocRepeatMode === 'repeat_3' ? 'selected' : ''}>+ 3 repeats (4 total)</option>
+                    <option value="continuous" ${state.ocRepeatMode === 'continuous' ? 'selected' : ''}>Continuous</option>
+                  </select>
+                </div>
               </div>
 
               <div class="mt-3" style="border-top: 1px solid #1f2937; padding-top: 8px; font-size: 0.8rem;">
@@ -5842,6 +5903,28 @@ let logoutNotificationSent = false;
         } else {
           updateStatus('OC schedule cleared — will trigger on cooldown');
         }
+      });
+    }
+
+    // OC Repeat mode selector
+    const repeatSelect = shadowRoot.querySelector('#tmn-oc-repeat-mode');
+    if (repeatSelect) {
+      repeatSelect.addEventListener('change', () => {
+        state.ocRepeatMode = repeatSelect.value;
+        // Set repeatsLeft based on mode
+        if (repeatSelect.value === 'repeat_1') state.ocRepeatsLeft = 1;
+        else if (repeatSelect.value === 'repeat_2') state.ocRepeatsLeft = 2;
+        else if (repeatSelect.value === 'repeat_3') state.ocRepeatsLeft = 3;
+        else state.ocRepeatsLeft = 0;
+        saveState();
+        const labels = {
+          once: 'Once (then stop)',
+          repeat_1: '+ 1 repeat (2 total)',
+          repeat_2: '+ 2 repeats (3 total)',
+          repeat_3: '+ 3 repeats (4 total)',
+          continuous: 'Continuous'
+        };
+        updateStatus(`OC repeat: ${labels[repeatSelect.value] || repeatSelect.value}`);
       });
     }
 
@@ -6892,7 +6975,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.04 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.05 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
