@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.05
+// @name         TMN TDS Auto v17.06
 // @namespace    http://tampermonkey.net/
-// @version      17.05
-// @description  v17.05 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.06
+// @description  v17.06 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -34,6 +34,20 @@
     } catch (e) {
         console.warn('[TMN] Failed to inject auto-confirm override:', e);
     }
+})();
+
+// ---------------------------
+// LOGOUT INTERCEPT
+// ---------------------------
+// When the server redirects to /login.aspx?act=out (session timeout, forced logout),
+// immediately bounce back to the main page before the session cookie is cleared.
+// This catches background-tab logouts where the script was idle.
+(function () {
+  if (window.location.href.includes('login.aspx') && window.location.href.includes('act=out')) {
+    console.log('[TMN] Logout redirect intercepted — bouncing back');
+    window.location.replace('https://www.tmn2010.net/default.aspx');
+    return;
+  }
 })();
 
 (function () {
@@ -245,7 +259,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.05\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.06\n${message}`;
     }
 
     function clearTimers() {
@@ -4917,6 +4931,32 @@ let logoutNotificationSent = false;
         return true;
       }
 
+      // CANCELLATION DETECTION: if we're in setup (step 1-4) but the OC page shows
+      // neither the invite form NOR active start buttons NOR a commit button, the OC
+      // was dismissed/cancelled externally (player cancelled in-game). Auto-reset.
+      if (step >= 1 && step <= 4) {
+        const hasInviteForm = !!document.getElementById('ctl00_main_txtinvitename');
+        const hasStartBtn = !!(
+          (document.getElementById('ctl00_main_btnStartOCRobCasino') && !document.getElementById('ctl00_main_btnStartOCRobCasino').disabled) ||
+          (document.getElementById('ctl00_main_btnStartOCRobArmoury') && !document.getElementById('ctl00_main_btnStartOCRobArmoury').disabled) ||
+          (document.getElementById('ctl00_main_btnStartOCRobBank') && !document.getElementById('ctl00_main_btnStartOCRobBank').disabled)
+        );
+        const hasCommitBtn = !!document.getElementById('ctl00_main_btnCommitOC');
+        const hasBuyBtn = !!document.getElementById('ctl00_main_btnBuySecurity');
+
+        if (!hasInviteForm && !hasCommitBtn && !hasBuyBtn && hasStartBtn) {
+          // Start buttons are showing again → OC was cancelled/dismissed
+          console.log('[TMN][CreateOC] OC appears to have been cancelled externally — resetting');
+          sendTelegramMessage(
+            '⚠️ <b>OC Cancelled (External)</b>\n\n' +
+            `Player: ${username}\n` +
+            'OC was dismissed in-game — resetting Create OC state'
+          );
+          resetCreateOC();
+          return false;
+        }
+      }
+
       // STEP 0: Click start button based on user's OC type preference
       if (step === 0) {
         const casinoBtn = document.getElementById('ctl00_main_btnStartOCRobCasino');
@@ -5175,7 +5215,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.05</strong>
+          <strong>TMN TDS Auto v17.06</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -6975,7 +7015,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.05 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.06 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
