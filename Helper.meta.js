@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.06
+// @name         TMN TDS Auto v17.07
 // @namespace    http://tampermonkey.net/
-// @version      17.06
-// @description  v17.06 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.07
+// @description  v17.07 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
