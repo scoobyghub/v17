@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.06
+// @name         TMN TDS Auto v17.07
 // @namespace    http://tampermonkey.net/
-// @version      17.06
-// @description  v17.06 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.07
+// @description  v17.07 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -34,20 +34,6 @@
     } catch (e) {
         console.warn('[TMN] Failed to inject auto-confirm override:', e);
     }
-})();
-
-// ---------------------------
-// LOGOUT INTERCEPT
-// ---------------------------
-// When the server redirects to /login.aspx?act=out (session timeout, forced logout),
-// immediately bounce back to the main page before the session cookie is cleared.
-// This catches background-tab logouts where the script was idle.
-(function () {
-  if (window.location.href.includes('login.aspx') && window.location.href.includes('act=out')) {
-    console.log('[TMN] Logout redirect intercepted — bouncing back');
-    window.location.replace('https://www.tmn2010.net/default.aspx');
-    return;
-  }
 })();
 
 (function () {
@@ -259,7 +245,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.06\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.07\n${message}`;
     }
 
     function clearTimers() {
@@ -3655,12 +3641,33 @@ let logoutNotificationSent = false;
     }
 
     if (availableCrimes.length === 0) {
+      // Buttons might not be rendered yet (page still loading, or script started
+      // before DOM was fully ready). Retry once after a short delay before giving up.
+      const retryKey = 'tmnCrimeRetryCount';
+      const retries = parseInt(localStorage.getItem(retryKey) || '0', 10);
+      if (retries < 3) {
+        localStorage.setItem(retryKey, String(retries + 1));
+        console.log(`[TMN] No crime buttons found — retry ${retries + 1}/3 in 2s`);
+        updateStatus(`Crime buttons loading... (retry ${retries + 1}/3)`);
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        // Force a page reload on retry to ensure fresh DOM
+        setTimeout(() => {
+          state.needsRefresh = true;
+          saveState();
+        }, 2000);
+        return;
+      }
+      localStorage.removeItem(retryKey);
       updateStatus("No available crime buttons found");
       state.isPerformingAction = false;
       state.currentAction = '';
       GM_setValue('actionStartTime', 0);
       return;
     }
+    // Clear retry counter on success
+    localStorage.removeItem('tmnCrimeRetryCount');
 
     const randomBtn = availableCrimes[Math.floor(Math.random() * availableCrimes.length)];
     randomBtn.click();
@@ -3730,6 +3737,22 @@ let logoutNotificationSent = false;
     }
 
     if (availableGTAs.length === 0) {
+      const retryKey = 'tmnGTARetryCount';
+      const retries = parseInt(localStorage.getItem(retryKey) || '0', 10);
+      if (retries < 3) {
+        localStorage.setItem(retryKey, String(retries + 1));
+        console.log(`[TMN] No GTA options found — retry ${retries + 1}/3 in 2s`);
+        updateStatus(`GTA options loading... (retry ${retries + 1}/3)`);
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        setTimeout(() => {
+          state.needsRefresh = true;
+          saveState();
+        }, 2000);
+        return;
+      }
+      localStorage.removeItem(retryKey);
       updateStatus("No GTA options found - resetting action state");
       state.isPerformingAction = false;
       state.currentAction = '';
@@ -3738,6 +3761,7 @@ let logoutNotificationSent = false;
       saveState();
       return;
     }
+    localStorage.removeItem('tmnGTARetryCount');
 
     const randomRadio = availableGTAs[Math.floor(Math.random() * availableGTAs.length)];
     randomRadio.checked = true;
@@ -3863,6 +3887,22 @@ let logoutNotificationSent = false;
         GM_setValue('actionStartTime', 0);
       }, randomDelay(DELAYS.normal));
     } else {
+      const retryKey = 'tmnBoozeRetryCount';
+      const retries = parseInt(localStorage.getItem(retryKey) || '0', 10);
+      if (retries < 3) {
+        localStorage.setItem(retryKey, String(retries + 1));
+        console.log(`[TMN] No booze options found — retry ${retries + 1}/3 in 2s`);
+        updateStatus(`Booze options loading... (retry ${retries + 1}/3)`);
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        setTimeout(() => {
+          state.needsRefresh = true;
+          saveState();
+        }, 2000);
+        return;
+      }
+      localStorage.removeItem(retryKey);
       updateStatus("No booze options available");
       state.isPerformingAction = false;
       state.currentAction = '';
@@ -5215,7 +5255,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.06</strong>
+          <strong>TMN TDS Auto v17.07</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -7015,7 +7055,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.06 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.07 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
