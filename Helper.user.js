@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.07
+// @name         TMN TDS Auto v17.10
 // @namespace    http://tampermonkey.net/
-// @version      17.07
-// @description  v17.07 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.10
+// @description  v17.10 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -245,7 +245,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.07\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.10\n${message}`;
     }
 
     function clearTimers() {
@@ -683,21 +683,18 @@ if (currentPath.includes("/authenticated/")) {
         return true;
       }
 
-      // If no master or master hasn't sent heartbeat recently, try to become master
+      // If no master or master hasn't sent heartbeat recently, become master immediately.
+      // The old code used a 100ms setTimeout which created a race condition: checkMasterStatus
+      // returned false (not yet master) before becomeMaster fired, causing mainLoop to show
+      // "Secondary tab" even with only one tab open. Now we become master synchronously.
       if (!currentMaster || (now - lastHeartbeat) > this.MASTER_TIMEOUT) {
-        // Use lock to prevent race condition when multiple tabs try to become master
         const lock = localStorage.getItem(LS_TAB_LOCK);
         if (!lock || (now - parseInt(lock, 10)) > 1000) {
           localStorage.setItem(LS_TAB_LOCK, now.toString());
-          // Double-check after setting lock
-          setTimeout(() => {
-            const stillNoMaster = !localStorage.getItem(LS_TAB_MASTER) ||
-              (Date.now() - parseInt(localStorage.getItem(LS_TAB_HEARTBEAT) || "0", 10)) > this.MASTER_TIMEOUT;
-            if (stillNoMaster) {
-              this.becomeMaster();
-            }
-          }, 100);
+          this.becomeMaster();
+          return true;
         }
+        // Another tab holds the lock — wait for next check
         return this.isMasterTab;
       }
 
@@ -1011,7 +1008,7 @@ if (currentPath.includes("/authenticated/")) {
       return;
     }
 
-    sendTelegramMessage('🎮 <b>TMN 2010 Automation</b>\n\nTelegram notifications are working!\n\nYou will receive alerts for:\n• Script checks (captcha)\n• New messages\n• SQL script checks\n• Logout/timeout\n• Low health alerts');
+    sendTelegramMessage('🎮 <b>TMN 2010 Automation</b>\n\nTelegram notifications are working!\n\nYou will receive alerts for:\n• Script checks (captcha)\n• New messages\n• Staff script checks (SQL / Stipe)\n• Logout/timeout\n• Low health alerts');
     alert('Test message sent! Check console (F12) and your Telegram.');
   }
 
@@ -1160,21 +1157,24 @@ if (currentPath.includes("/authenticated/")) {
     const importantMsgDiv = document.querySelector('div.NewGridTitle');
     const hasImportantMessage = importantMsgDiv && importantMsgDiv.textContent.includes('Important message');
 
-    // Method 2: Check page content for SQL script check indicators
+    // Method 2: Check page content for SQL/Stipe script check indicators
     const pageText = document.body.textContent;
     const hasSqlCheck = pageText.includes('SQL Script Check') ||
                         pageText.includes('SQL what your favourite') ||
-                        pageText.includes('tell SQL what');
+                        pageText.includes('tell SQL what') ||
+                        pageText.includes('Stipe Script Check') ||
+                        pageText.includes('Stipe what your favourite') ||
+                        pageText.includes('tell Stipe what');
 
     if ((hasImportantMessage || hasSqlCheck) && !sqlCheckNotificationSent) {
-      console.log('[Telegram] SQL Script Check detected! Sending notification...');
+      console.log('[Telegram] Staff Script Check detected! Sending notification...');
 
       // Try to extract the question
       let question = 'Please answer the admin question';
       const paragraphs = document.querySelectorAll('p, div');
       for (let p of paragraphs) {
         const text = p.textContent;
-        if (text.includes('SQL') && text.includes('?')) {
+        if ((text.includes('SQL') || text.includes('Stipe')) && text.includes('?')) {
           question = text.trim();
           break;
         }
@@ -1182,20 +1182,26 @@ if (currentPath.includes("/authenticated/")) {
 
       sendTelegramMessage(
 
-        '❗ <b>SQL SCRIPT CHECK!</b>\n\n' +
+        '❗ <b>STAFF SCRIPT CHECK!</b>\n\n' +
         `Player: ${state.playerName || 'Unknown'}\n` +
         `Time: ${formatDateUK()}\n\n` +
-        '🛑 Admin SQL needs a response!\n' +
+        '🛑 Staff needs a response!\n' +
         `Question: ${question}\n\n` +
         '👉 Please answer the question to continue'
       );
 
       sqlCheckNotificationSent = true;
-      console.log('[Telegram] SQL script check notification sent');
+      console.log('[Telegram] Staff script check notification sent');
       return true;
     } else if (!hasImportantMessage && !hasSqlCheck) {
-      // Reset flag when no longer on SQL check page
+      // Reset flag when no longer on staff check page
       sqlCheckNotificationSent = false;
+      // Resume automation if we paused for a staff check
+      if (automationPaused) {
+        automationPaused = false;
+        console.log('[TMN] Staff check cleared — resuming automation');
+        updateStatus('Staff check cleared — automation resumed');
+      }
     }
 
     return false;
@@ -2419,8 +2425,10 @@ let logoutNotificationSent = false;
 
         // Check DTM invite - use localStorage to track if already processed
         const isDTMInvite = /(dtm\s*invitation|dtm\s*invite|drug\s*trade)/i.test(rowText);
-        if (isDTMInvite) {
-          console.log(`[TMN][MAIL] DTM invite detected! mailId=${mailId} autoDTM=${state.autoDTM} sender="${sender}" cells=${cells.length} rowText="${rowText.substring(0, 100)}"`);
+        if (isDTMInvite && !state.autoDTM) {
+          // Auto DTM is off — mark as seen so we don't re-detect it every scan cycle
+          localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
+          continue;
         }
         if (isDTMInvite && state.autoDTM) {
           // DEDUP LAYER 1: Cooldown — skip if we already accepted a DTM within last 2 hours
@@ -2468,6 +2476,11 @@ let logoutNotificationSent = false;
 
         // Check OC invite
         const isOCInvite = /(organized\s*crime\s*invitation|oc\s*invitation)/i.test(rowText);
+        if (isOCInvite && !state.autoOC) {
+          // Auto OC is off — mark as seen so we don't re-detect it every scan cycle
+          localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
+          continue;
+        }
         if (isOCInvite && state.autoOC) {
           // DEDUP LAYER 1: Cooldown — skip if we already accepted an OC within last 2 hours
           const lastAcceptTs = parseInt(localStorage.getItem(LS_LAST_OC_ACCEPT_TS) || '0', 10);
@@ -5255,7 +5268,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.07</strong>
+          <strong>TMN TDS Auto v17.10</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -6677,9 +6690,16 @@ async function mainLoop() {
     // Check for Telegram notifications
     checkForCaptcha();
     checkForNewMessages();
-    checkForSqlScriptCheck();
     checkForLogout();
     checkForLowHealth();
+
+    // Staff script check — if detected, pause automation and alert
+    if (checkForSqlScriptCheck()) {
+      automationPaused = true;
+      updateStatus('⚠️ STAFF CHECK — automation paused, respond manually!');
+      setTimeout(mainLoop, 10000); // Keep checking in case it clears
+      return;
+    }
 
     // Check for stuck actions before anything else
     checkForNavigationInterruption();
@@ -7055,7 +7075,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.07 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.10 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
