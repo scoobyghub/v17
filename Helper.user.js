@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.10
+// @name         TMN TDS Auto v17.20
 // @namespace    http://tampermonkey.net/
-// @version      17.10
-// @description  v17.10 — OC Team Creation, Hot City, crusher system, whitelist, protection timer, draggable UI, Telegram alerts
+// @version      17.20
+// @description  v17.20 — fixes Telegram logout/timeout alerts on login.aspx?act=out and keeps v17.13 crusher flow
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -18,6 +18,19 @@
 // @updateURL    https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.meta.js
 // @downloadURL  https://raw.githubusercontent.com/scoobyghub/v17/refs/heads/main/Helper.user.js
 // ==/UserScript==
+
+/*
+TMN TDS Auto v17.20 CHANGELOG
+- Added request timeouts to background GET requests used by mailbox/invite checks so a hanging request cannot stall the main loop.
+- Added Telegram POST timeouts and stored last Telegram send status/error for easier troubleshooting.
+- Fixed main-loop mail gate so Script Test and SQL/Stipe Staff Mail alerts still scan when general Notify Messages is disabled.
+- Added an in-flight lock around unifiedMailCheck() to prevent overlapping mailbox scans.
+- Added an authenticated captcha submit guard to avoid repeated submit-click scheduling while the same captcha token remains present.
+- Added missing actionStartTime writes for OC/DTM/health/pending-invite action states so stuck-action recovery has a valid timestamp.
+- Escaped dynamic Telegram HTML fields in staff/page and normal mail alerts to avoid malformed Telegram messages.
+- Kept the v17.13-style one-car crusher flow and the v17.19 logout/timeout Telegram fix.
+- Reliability/load cleanup only: no changes intended to bypass site detection or restrictions.
+*/
 
 
 (function () {
@@ -117,6 +130,56 @@
   let titleFlashInterval = null;
   const originalTitle = document.title;
 
+  function supportsBrowserNotifications() {
+    return typeof window !== 'undefined' && 'Notification' in window;
+  }
+
+  function requestBrowserNotificationPermission() {
+    if (!supportsBrowserNotifications()) return Promise.resolve('unsupported');
+    try {
+      if (Notification.permission === 'default') {
+        return Notification.requestPermission().catch(() => 'denied');
+      }
+      return Promise.resolve(Notification.permission);
+    } catch (e) {
+      console.warn('[TMN] Browser notification permission request failed:', e);
+      return Promise.resolve('denied');
+    }
+  }
+
+  function showBrowserNotification(title, options = {}, onClick) {
+    if (!supportsBrowserNotifications()) {
+      console.warn('[TMN] Browser notifications are not supported in this browser/context');
+      return false;
+    }
+
+    const createNotification = () => {
+      try {
+        const notification = new Notification(title, Object.assign({
+          requireInteraction: true,
+          icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+        }, options));
+        if (typeof onClick === 'function') {
+          notification.onclick = () => {
+            try { onClick(notification); } catch (e) { console.warn('[TMN] Notification click handler failed:', e); }
+          };
+        }
+        return true;
+      } catch (e) {
+        console.warn('[TMN] Browser notification failed:', e);
+        return false;
+      }
+    };
+
+    if (Notification.permission === 'granted') return createNotification();
+    if (Notification.permission === 'default') {
+      requestBrowserNotificationPermission().then(permission => {
+        if (permission === 'granted') createNotification();
+      });
+    }
+    return false;
+  }
+
   function flashTabTitle() {
     if (titleFlashInterval) return; // Already flashing
     let toggle = false;
@@ -135,22 +198,12 @@
   }
 
   function showLogoutBrowserNotification() {
-    if (Notification.permission === 'granted') {
-      new Notification('TMN2010 Session Expired', {
-        body: 'Click to switch to tab and log back in',
-        requireInteraction: true,
-        icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
-      });
-    } else if (Notification.permission === 'default') {
-      Notification.requestPermission().then(perm => {
-        if (perm === 'granted') {
-          new Notification('TMN2010 Session Expired', {
-            body: 'Click to switch to tab and log back in',
-            requireInteraction: true
-          });
-        }
-      });
-    }
+    showBrowserNotification('TMN2010 Session Expired', {
+      body: 'Click to switch to tab and log back in'
+    }, (notification) => {
+      window.focus();
+      if (notification && typeof notification.close === 'function') notification.close();
+    });
   }
 
   function triggerLogoutAlerts() {
@@ -159,6 +212,136 @@
     }
     if (logoutAlertConfig.browserNotify) {
       showLogoutBrowserNotification();
+    }
+  }
+
+
+  // Telegram logout/timeout alert helper is defined early because the script
+  // exits on login.aspx before the main Telegram config block exists.
+  // v17.20 fix: the previous boolean de-dupe could stay stuck as "sent" and block
+  // future alerts on https://www.tmn2010.net/login.aspx?act=out. This now uses a
+  // short timestamp cooldown and a URL-aware key, so act=out is caught reliably
+  // without spamming Telegram on login page refreshes.
+  const LS_LOGOUT_TELEGRAM_SENT = 'tmnLogoutTelegramSent';
+  const LS_LOGOUT_TELEGRAM_LAST_TS = 'tmnLogoutTelegramLastTs';
+  const LS_LOGOUT_TELEGRAM_LAST_KEY = 'tmnLogoutTelegramLastKey';
+  const LOGOUT_TELEGRAM_COOLDOWN_MS = 2 * 60 * 1000;
+
+  function getLogoutAlertKey(urlLower) {
+    if (urlLower.includes('act=out')) return 'act-out';
+    if (urlLower.includes('timeout')) return 'timeout';
+    if (urlLower.includes('session')) return 'session';
+    if (urlLower.includes('auto=true')) return 'auto';
+    return 'login-page';
+  }
+
+  function clearLogoutTelegramDedupState() {
+    try {
+      localStorage.removeItem(LS_LOGOUT_TELEGRAM_SENT);
+      localStorage.removeItem(LS_LOGOUT_TELEGRAM_LAST_TS);
+      localStorage.removeItem(LS_LOGOUT_TELEGRAM_LAST_KEY);
+    } catch {}
+  }
+
+  function wasLogoutTelegramRecentlySent(alertKey) {
+    try {
+      const legacySent = localStorage.getItem(LS_LOGOUT_TELEGRAM_SENT) === 'true';
+      const lastTs = parseInt(localStorage.getItem(LS_LOGOUT_TELEGRAM_LAST_TS) || '0', 10);
+      const lastKey = localStorage.getItem(LS_LOGOUT_TELEGRAM_LAST_KEY) || '';
+      const fresh = lastTs && (Date.now() - lastTs) < LOGOUT_TELEGRAM_COOLDOWN_MS;
+
+      // Convert the old stuck boolean into timestamp behaviour instead of letting
+      // it permanently block future logout/timeout Telegram alerts.
+      if (legacySent && !lastTs) {
+        localStorage.removeItem(LS_LOGOUT_TELEGRAM_SENT);
+        return false;
+      }
+
+      return Boolean(fresh && lastKey === alertKey);
+    } catch {
+      return false;
+    }
+  }
+
+  function markLogoutTelegramSent(alertKey) {
+    try {
+      localStorage.setItem(LS_LOGOUT_TELEGRAM_LAST_TS, String(Date.now()));
+      localStorage.setItem(LS_LOGOUT_TELEGRAM_LAST_KEY, alertKey);
+      localStorage.removeItem(LS_LOGOUT_TELEGRAM_SENT);
+    } catch {}
+  }
+
+  function sendEarlyLogoutTelegramIfNeeded(source = 'login-page') {
+    try {
+      const telegramEnabled = GM_getValue('telegramEnabled', false);
+      const notifyLogout = GM_getValue('notifyLogout', true);
+      const botToken = GM_getValue('telegramBotToken', '');
+      const chatId = GM_getValue('telegramChatId', '');
+      if (!telegramEnabled || !notifyLogout || !botToken || !chatId) {
+        console.log('[Telegram] Logout alert skipped: Telegram disabled, logout notify disabled, or missing bot/chat settings');
+        return false;
+      }
+
+      const currentUrl = window.location.href.toLowerCase();
+      const isLoginUrl = currentUrl.includes('login.aspx');
+      const alertKey = getLogoutAlertKey(currentUrl);
+
+      // The act=out URL itself is enough proof. Do not wait for login form DOM,
+      // because the script exits early on the login page and the form may not be
+      // available at the first check.
+      const isExplicitLogoutUrl = alertKey !== 'login-page';
+      const hasLoginForm = Boolean(
+        document.querySelector('input[name="ctl00$main$txtUsername"], #ctl00_main_txtUsername') ||
+        document.querySelector('input[type="password"], #ctl00_main_txtPassword') ||
+        document.querySelector('input[value="Login"], input[type="submit"], button[type="submit"]')
+      );
+      if (!isLoginUrl && !hasLoginForm) return false;
+      if (!isExplicitLogoutUrl && !hasLoginForm && document.readyState === 'loading') return false;
+      if (wasLogoutTelegramRecentlySent(alertKey)) return false;
+
+      const isAutoLogout = isExplicitLogoutUrl;
+      const logoutType = isAutoLogout ? 'AUTO LOGOUT / TIMEOUT' : 'LOGOUT / LOGIN PAGE';
+      const reason = isAutoLogout
+        ? 'You have been automatically logged out or timed out.'
+        : 'The script has landed on the login page and automation cannot continue until login is restored.';
+
+      const message =
+        `🚪 <b>${logoutType} DETECTED!</b>\n\n` +
+        `Player: ${GM_getValue('playerName', '') || 'Unknown'}\n` +
+        `Time: ${formatDateUK()}\n\n` +
+        `${reason}\n\n` +
+        `URL: ${escapeHtml(window.location.href)}\n` +
+        `Source: ${source}\n` +
+        '🔑 Please log back in to resume automation';
+
+      markLogoutTelegramSent(alertKey);
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: `https://api.telegram.org/bot${botToken}/sendMessage`,
+        timeout: 15000,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ chat_id: chatId, text: message, parse_mode: 'HTML' }),
+        onload: function(response) {
+          if (response.status === 200) {
+            console.log('[Telegram] Early logout/timeout alert sent successfully');
+          } else {
+            console.error('[Telegram] Early logout/timeout alert failed:', response.status, response.responseText);
+            clearLogoutTelegramDedupState();
+          }
+        },
+        onerror: function(error) {
+          console.error('[Telegram] Early logout/timeout alert network error:', error);
+          clearLogoutTelegramDedupState();
+        },
+        ontimeout: function() {
+          console.error('[Telegram] Early logout/timeout alert timed out');
+          clearLogoutTelegramDedupState();
+        }
+      });
+      return true;
+    } catch (e) {
+      console.warn('[TMN] Early logout Telegram check failed:', e);
+      return false;
     }
   }
 
@@ -205,6 +388,13 @@
   if (isLoginPage) {
     // Trigger logout alerts (tab flash, browser notification) when redirected to login page
     triggerLogoutAlerts();
+    // Telegram alert must run here because the script exits before the normal Telegram block on login.aspx.
+    sendEarlyLogoutTelegramIfNeeded('login-page-start');
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => sendEarlyLogoutTelegramIfNeeded('login-page-dom-ready'), { once: true });
+    } else {
+      setTimeout(() => sendEarlyLogoutTelegramIfNeeded('login-page-ready'), 800);
+    }
 
     // AUTO-LOGIN CODE
     const USERNAME_ID = "ctl00_main_txtUsername";
@@ -245,7 +435,7 @@
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.10\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.20\n${message}`;
     }
 
     function clearTimers() {
@@ -443,6 +633,7 @@
   // RESET LOGIN ATTEMPTS WHEN SUCCESSFULLY AUTHENTICATED
   // ============================================================
   if (currentPath.includes("/authenticated/")) {
+    localStorage.removeItem(LS_LOGOUT_TELEGRAM_SENT);
     const loginAttempts = parseInt(localStorage.getItem("tmnLoginAttempts") || "0", 10);
     const loginPaused = localStorage.getItem("tmnLoginPaused") === "true";
     if (loginAttempts > 0 || loginPaused) {
@@ -457,6 +648,8 @@
 // CAPTCHA HANDLER FOR AUTHENTICATED PAGES
 // ============================================================
 if (currentPath.includes("/authenticated/")) {
+  let authenticatedCaptchaSubmitScheduled = false;
+
   function handleAuthenticatedCaptcha() {
     const captchaFrame = document.querySelector('iframe[src*="recaptcha"]');
     const captchaResponse = document.querySelector('textarea[name="g-recaptcha-response"]');
@@ -465,7 +658,9 @@ if (currentPath.includes("/authenticated/")) {
       const token = captchaResponse?.value?.trim();
 
       if (token && token.length > 0) {
-        // Captcha completed - find and click submit
+        // Captcha completed - find and click submit. Guard prevents duplicate clicks
+        // while the same captcha token remains visible during slow page loads.
+        if (authenticatedCaptchaSubmitScheduled) return;
         const submitBtn = document.querySelector('input[type="submit"], button[type="submit"]') ||
                          document.getElementById('ctl00_main_btnVerify') ||
                          Array.from(document.querySelectorAll('input, button')).find(b =>
@@ -474,10 +669,21 @@ if (currentPath.includes("/authenticated/")) {
                          );
 
         if (submitBtn && !submitBtn.disabled) {
-          console.log('[TMN] Captcha completed - submitting...');
-          setTimeout(() => submitBtn.click(), 1000);
+          authenticatedCaptchaSubmitScheduled = true;
+          console.log('[TMN] Captcha completed - submitting once...');
+          setTimeout(() => {
+            try { submitBtn.click(); }
+            catch (e) {
+              authenticatedCaptchaSubmitScheduled = false;
+              console.warn('[TMN] Captcha submit click failed:', e);
+            }
+          }, 1000);
         }
+      } else {
+        authenticatedCaptchaSubmitScheduled = false;
       }
+    } else {
+      authenticatedCaptchaSubmitScheduled = false;
     }
   }
 
@@ -525,6 +731,31 @@ if (currentPath.includes("/authenticated/")) {
     return new Promise(resolve => setTimeout(resolve, randomDelay(range)));
   }
 
+  // OC/DTM-specific human-like action delays.
+  // Keeps invite accepts, role selections, DTM buys/completes, and OC creation clicks
+  // between 3 and 20 seconds without changing the normal crime/GTA/booze timings.
+  const OC_DTM_ACTION_DELAY = [3000, 20000];
+
+  function randomOCDTMActionDelay() {
+    return randomDelay(OC_DTM_ACTION_DELAY);
+  }
+
+  function scheduleOCDTMAction(label, fn) {
+    const delay = randomOCDTMActionDelay();
+    console.log(`[TMN][OC/DTM DELAY] ${label} in ${Math.round(delay / 1000)}s`);
+    updateStatus(`${label} in ${Math.round(delay / 1000)}s...`);
+    setTimeout(fn, delay);
+    return delay;
+  }
+
+  async function waitOCDTMActionDelay(label) {
+    const delay = randomOCDTMActionDelay();
+    console.log(`[TMN][OC/DTM DELAY] ${label} waiting ${Math.round(delay / 1000)}s`);
+    updateStatus(`${label} in ${Math.round(delay / 1000)}s...`);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return delay;
+  }
+
     // ---------------------------
   // Telegram Configuration
   // ---------------------------
@@ -534,6 +765,8 @@ if (currentPath.includes("/authenticated/")) {
     enabled: GM_getValue('telegramEnabled', false),
     notifyCaptcha: GM_getValue('notifyCaptcha', true),
     notifyMessages: GM_getValue('notifyMessages', true),
+    notifyInboxScriptTest: GM_getValue('notifyInboxScriptTest', true),
+    notifyStaffMailCheck: GM_getValue('notifyStaffMailCheck', true),
     lastMessageCheck: GM_getValue('lastMessageCheck', 0),
     messageCheckInterval: GM_getValue('messageCheckInterval', 60),
     notifySqlCheck: GM_getValue('notifySqlCheck', true),
@@ -546,11 +779,72 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('telegramEnabled', telegramConfig.enabled);
     GM_setValue('notifyCaptcha', telegramConfig.notifyCaptcha);
     GM_setValue('notifyMessages', telegramConfig.notifyMessages);
+    GM_setValue('notifyInboxScriptTest', telegramConfig.notifyInboxScriptTest);
+    GM_setValue('notifyStaffMailCheck', telegramConfig.notifyStaffMailCheck);
     GM_setValue('lastMessageCheck', telegramConfig.lastMessageCheck);
     GM_setValue('messageCheckInterval', telegramConfig.messageCheckInterval);
     GM_setValue('notifySqlCheck', telegramConfig.notifySqlCheck);
     GM_setValue('notifyLogout', telegramConfig.notifyLogout);
   }
+
+  // ---------------------------
+  // Online Player Watch Alert Configuration
+  // Integrated from TMN2010 Online Watcher v1.0.0
+  // ---------------------------
+  const ONLINE_WATCH_MAX_NAMES = 10;
+  const ONLINE_WATCH_DEFAULT_SCAN_SECONDS = 60;
+  const ONLINE_WATCH_MIN_SCAN_SECONDS = 20;
+  const ONLINE_WATCH_ALERT_COOLDOWN_MS = 5 * 60 * 1000;
+  const ONLINE_WATCH_FETCH_TIMEOUT_MS = 15000;
+  const ONLINE_WATCH_PAGE_CANDIDATES = [
+    '/authenticated/players.aspx',
+    '/Authenticated/players.aspx'
+  ];
+
+  const onlineWatchConfig = {
+    enabled: GM_getValue('onlineWatchEnabled', false),
+    scanSeconds: GM_getValue('onlineWatchScanSeconds', ONLINE_WATCH_DEFAULT_SCAN_SECONDS),
+    browserNotify: GM_getValue('onlineWatchBrowserNotify', true),
+    tabFlash: GM_getValue('onlineWatchTabFlash', true),
+    soundAlert: GM_getValue('onlineWatchSoundAlert', true),
+    telegramNotify: GM_getValue('onlineWatchTelegramNotify', true),
+    watchList: GM_getValue('onlineWatchList', []),
+    lastOnline: GM_getValue('onlineWatchLastOnline', {}),
+    lastAlert: GM_getValue('onlineWatchLastAlert', {}),
+    lastScanAt: GM_getValue('onlineWatchLastScanAt', 0),
+    lastScanOk: GM_getValue('onlineWatchLastScanOk', false),
+    lastScanMessage: GM_getValue('onlineWatchLastScanMessage', 'Not scanned yet')
+  };
+
+  // Defensive upgrade for older/bad saved data
+  if (!Array.isArray(onlineWatchConfig.watchList)) onlineWatchConfig.watchList = [];
+  onlineWatchConfig.watchList = onlineWatchConfig.watchList.slice(0, ONLINE_WATCH_MAX_NAMES);
+  if (!onlineWatchConfig.lastOnline || typeof onlineWatchConfig.lastOnline !== 'object') onlineWatchConfig.lastOnline = {};
+  if (!onlineWatchConfig.lastAlert || typeof onlineWatchConfig.lastAlert !== 'object') onlineWatchConfig.lastAlert = {};
+  onlineWatchConfig.scanSeconds = Math.max(
+    ONLINE_WATCH_MIN_SCAN_SECONDS,
+    Math.min(3600, Number(onlineWatchConfig.scanSeconds || ONLINE_WATCH_DEFAULT_SCAN_SECONDS))
+  );
+
+  let onlineWatchTimer = null;
+  let onlineWatchInProgress = false;
+  let onlineWatchTitleFlashTimer = null;
+
+  function saveOnlineWatchConfig() {
+    GM_setValue('onlineWatchEnabled', onlineWatchConfig.enabled);
+    GM_setValue('onlineWatchScanSeconds', onlineWatchConfig.scanSeconds);
+    GM_setValue('onlineWatchBrowserNotify', onlineWatchConfig.browserNotify);
+    GM_setValue('onlineWatchTabFlash', onlineWatchConfig.tabFlash);
+    GM_setValue('onlineWatchSoundAlert', onlineWatchConfig.soundAlert);
+    GM_setValue('onlineWatchTelegramNotify', onlineWatchConfig.telegramNotify);
+    GM_setValue('onlineWatchList', onlineWatchConfig.watchList.slice(0, ONLINE_WATCH_MAX_NAMES));
+    GM_setValue('onlineWatchLastOnline', onlineWatchConfig.lastOnline);
+    GM_setValue('onlineWatchLastAlert', onlineWatchConfig.lastAlert);
+    GM_setValue('onlineWatchLastScanAt', onlineWatchConfig.lastScanAt);
+    GM_setValue('onlineWatchLastScanOk', onlineWatchConfig.lastScanOk);
+    GM_setValue('onlineWatchLastScanMessage', onlineWatchConfig.lastScanMessage);
+  }
+
 
   let state = {
     autoCrime: GM_getValue('autoCrime', false),
@@ -600,6 +894,27 @@ if (currentPath.includes("/authenticated/")) {
     ocRepeatMode: GM_getValue('ocRepeatMode', 'once'),
     ocRepeatsLeft: GM_getValue('ocRepeatsLeft', 0)
   };
+
+  // v17.20 recovery: v17.17 could persistently disable Auto Crusher if the
+  // Send to Crusher button looked disabled after selection. Reset that one-time
+  // stored state so the restored v17.13 crusher flow can run again.
+  try {
+    const crusherResetKey = 'tmnV1718CrusherResetApplied';
+    if (GM_getValue(crusherResetKey, false) !== true) {
+      if (GM_getValue('crusherOwned', null) === false) {
+        state.crusherOwned = null;
+        GM_setValue('crusherOwned', null);
+        state.autoCrusher = true;
+        GM_setValue('autoCrusher', true);
+        localStorage.removeItem('tmnCrusherLoopCount');
+        localStorage.removeItem('tmnPendingCrushName');
+        console.log('[TMN] v17.20 reset stale crusher-disabled state from previous build');
+      }
+      GM_setValue(crusherResetKey, true);
+    }
+  } catch (e) {
+    console.warn('[TMN] v17.20 crusher state reset failed:', e);
+  }
 
   let automationPaused = false;
 
@@ -820,6 +1135,7 @@ if (currentPath.includes("/authenticated/")) {
         'selectedCrimes', 'selectedGTAs', 'playerName', 'inJail', 'crimeCollapsed', 'gtaCollapsed',
         'boozeCollapsed', 'panelMinimized', 'lastJailCheck', 'currentAction', 'needsRefresh', 'pendingAction',
         'autoOC', 'autoDTM',
+        'lastStaffScriptMailId', 'lastScriptTestMailId', 'lastNotifiedMailId', 'notifyStaffMailCheck',
 
         // Config values
         'crimeInterval', 'gtaInterval', 'jailbreakInterval', 'jailCheckInterval', 'boozeInterval',
@@ -832,6 +1148,11 @@ if (currentPath.includes("/authenticated/")) {
 
         // Auto-Resume Config
         'autoResumeEnabled',
+
+        // Online Watch Alert config
+        'onlineWatchEnabled', 'onlineWatchScanSeconds', 'onlineWatchBrowserNotify', 'onlineWatchTabFlash',
+        'onlineWatchSoundAlert', 'onlineWatchTelegramNotify', 'onlineWatchList', 'onlineWatchLastOnline',
+        'onlineWatchLastAlert', 'onlineWatchLastScanAt', 'onlineWatchLastScanOk', 'onlineWatchLastScanMessage',
 
         // Stats Collection Config
         'statsCollectionEnabled', 'statsCollectionInterval', 'lastStatsCollection', 'cachedGameStats',
@@ -962,6 +1283,16 @@ if (currentPath.includes("/authenticated/")) {
   // Telegram Functions (COMPLETE)
   // ---------------------------
 
+  const TELEGRAM_SEND_TIMEOUT_MS = 15000;
+
+  function setTelegramLastStatus(ok, detail) {
+    try {
+      GM_setValue('telegramLastSendOk', Boolean(ok));
+      GM_setValue('telegramLastSendAt', Date.now());
+      GM_setValue('telegramLastSendDetail', String(detail || '').substring(0, 300));
+    } catch {}
+  }
+
   function sendTelegramMessage(message) {
     console.log('[Telegram] Attempting to send message...');
 
@@ -980,6 +1311,7 @@ if (currentPath.includes("/authenticated/")) {
     GM_xmlhttpRequest({
       method: 'POST',
       url: url,
+      timeout: TELEGRAM_SEND_TIMEOUT_MS,
       headers: {
         'Content-Type': 'application/json'
       },
@@ -990,16 +1322,74 @@ if (currentPath.includes("/authenticated/")) {
       }),
       onload: function(response) {
         if (response.status === 200) {
-          console.log('[Telegram] âœ“ Message sent successfully!');
+          console.log('[Telegram] Message sent successfully!');
+          setTelegramLastStatus(true, 'Telegram message sent');
         } else {
-          console.error('[Telegram] âœ— Failed to send message:', response.status);
+          console.error('[Telegram] Failed to send message:', response.status);
           console.error('[Telegram] Response:', response.responseText);
+          setTelegramLastStatus(false, `HTTP ${response.status}: ${response.responseText || ''}`);
         }
       },
       onerror: function(error) {
-        console.error('[Telegram] âœ— Network error:', error);
+        console.error('[Telegram] Network error:', error);
+        setTelegramLastStatus(false, error?.message || 'Telegram network error');
+      },
+      ontimeout: function() {
+        console.error('[Telegram] Send timed out');
+        setTelegramLastStatus(false, 'Telegram send timed out');
       }
     });
+  }
+
+
+  function sendRepeatedTelegramMessage(message, count = 5, delayMs = 1500, label = 'Repeated alert') {
+    const repeats = Math.max(1, Math.min(10, parseInt(count, 10) || 5));
+    for (let i = 0; i < repeats; i++) {
+      setTimeout(() => {
+        console.log(`[Telegram] ${label} ${i + 1}/${repeats}`);
+        sendTelegramMessage(message);
+      }, i * delayMs);
+    }
+  }
+
+  function sendScriptTestInboxAlert(mailId, sender, subject) {
+    const msg =
+      '❗ <b>STAFF SCRIPT CHECK!</b>\n\n' +
+      `Player: ${state.playerName || 'Unknown'}\n` +
+      `Time: ${formatDateUK()}\n\n` +
+      '🛑 Inbox message needs a response!\n' +
+      `From: ${escapeHtml(sender || 'Unknown')}\n` +
+      `Title: <b>${escapeHtml(subject || 'Script test')}</b>\n` +
+      `Mail ID: ${escapeHtml(mailId || 'Unknown')}\n\n` +
+      '👉 Please open your TMN inbox and respond/check the message.';
+
+    sendRepeatedTelegramMessage(msg, 5, 1500, 'Script test inbox alert');
+  }
+
+  function isSqlOrStipeSender(sender) {
+    return /^(sql|stipe)$/i.test(String(sender || '').trim());
+  }
+
+  function hasSqlOrStipeStaffSignal(sender, subject, rowText, bodyText = '') {
+    const combined = `${sender || ''} ${subject || ''} ${rowText || ''} ${bodyText || ''}`;
+    return /\b(SQL|Stipe)\b/i.test(combined) &&
+           /(script\s*check|staff|admin|answer|question|reply|respond|favourite|favorite|important\s*message|mail|message)/i.test(combined);
+  }
+
+  function sendStaffMailCheckAlert(mailId, sender, subject, bodyText = '') {
+    const bodyPreview = bodyText ? `\n\n<pre>${escapeHtml(bodyText.substring(0, 500))}</pre>` : '';
+    const msg =
+      '❗ <b>STAFF SCRIPT CHECK!</b>\n\n' +
+      `Player: ${state.playerName || 'Unknown'}\n` +
+      `Time: ${formatDateUK()}\n\n` +
+      '🛑 SQL/Stipe inbox message needs a response!\n' +
+      `From: <b>${escapeHtml(sender || 'Unknown')}</b>\n` +
+      `Title: <b>${escapeHtml(subject || 'No subject')}</b>\n` +
+      `Mail ID: ${escapeHtml(mailId || 'Unknown')}` +
+      bodyPreview +
+      '\n\n👉 Please open your TMN inbox and respond/check the message.';
+
+    sendRepeatedTelegramMessage(msg, 5, 1500, 'SQL/Stipe staff mail alert');
   }
 
   function testTelegramConnection() {
@@ -1008,7 +1398,7 @@ if (currentPath.includes("/authenticated/")) {
       return;
     }
 
-    sendTelegramMessage('🎮 <b>TMN 2010 Automation</b>\n\nTelegram notifications are working!\n\nYou will receive alerts for:\n• Script checks (captcha)\n• New messages\n• Staff script checks (SQL / Stipe)\n• Logout/timeout\n• Low health alerts');
+    sendTelegramMessage('🎮 <b>TMN 2010 Automation</b>\n\nTelegram notifications are working!\n\nYou will receive alerts for:\n• Script checks (captcha)\n• New messages\n• Staff script checks (SQL / Stipe page checks)\n• SQL/Stipe inbox staff-check alerts (5x)\n• Inbox Script test alerts (5x)\n• Logout/timeout\n• Low health alerts');
     alert('Test message sent! Check console (F12) and your Telegram.');
   }
 
@@ -1186,7 +1576,7 @@ if (currentPath.includes("/authenticated/")) {
         `Player: ${state.playerName || 'Unknown'}\n` +
         `Time: ${formatDateUK()}\n\n` +
         '🛑 Staff needs a response!\n' +
-        `Question: ${question}\n\n` +
+        `Question: ${escapeHtml(question)}\n\n` +
         '👉 Please answer the question to continue'
       );
 
@@ -1215,39 +1605,39 @@ let logoutNotificationSent = false;
     }
 
     const currentUrl = window.location.href.toLowerCase();
+    const isLoginPageNow = currentUrl.includes('login.aspx');
 
-    // ONLY trigger on actual login page, not authenticated pages
-    const isLoginPage = currentUrl.includes('login.aspx');
-
-    // Must be on login.aspx to proceed
-    if (!isLoginPage) {
-      // Reset flag when on authenticated pages
+    if (!isLoginPageNow) {
       if (currentUrl.includes('/authenticated/')) {
         logoutNotificationSent = false;
-        // Stop tab flash if we've logged back in
+        clearLogoutTelegramDedupState();
         stopFlashTabTitle();
       }
       return false;
     }
 
-    // Now we're definitely on login.aspx - check if it's auto logout
-    const isAutoLogout = currentUrl.includes('act=out') || currentUrl.includes('auto=true');
+    const isAutoLogout = currentUrl.includes('act=out') ||
+                         currentUrl.includes('auto=true') ||
+                         currentUrl.includes('timeout') ||
+                         currentUrl.includes('session');
 
-    // Double-check with login form elements
-    const hasLoginForm = document.querySelector('input[name="ctl00$main$txtUsername"]') !== null ||
-                         document.querySelector('input[type="password"]') !== null ||
-                         document.querySelector('input[value="Login"]') !== null;
+    const hasLoginForm = document.querySelector('input[name="ctl00$main$txtUsername"], #ctl00_main_txtUsername') !== null ||
+                         document.querySelector('input[type="password"], #ctl00_main_txtPassword') !== null ||
+                         document.querySelector('input[value="Login"], input[type="submit"], button[type="submit"]') !== null;
 
-    if (hasLoginForm && !logoutNotificationSent) {
-      console.log('[Telegram] ACTUAL Logout/Login page detected! Sending notification...');
+    const alertKey = getLogoutAlertKey(currentUrl);
+    const alreadySent = logoutNotificationSent || wasLogoutTelegramRecentlySent(alertKey);
+    if ((hasLoginForm || isLoginPageNow) && !alreadySent) {
+      console.log('[Telegram] Logout/Login page detected! Sending notification...');
       console.log('[Telegram] URL:', currentUrl);
       console.log('[Telegram] Is auto logout:', isAutoLogout);
 
-      const logoutType = isAutoLogout ? 'AUTO LOGOUT' : 'LOGOUT';
+      const logoutType = isAutoLogout ? 'AUTO LOGOUT / TIMEOUT' : 'LOGOUT / LOGIN PAGE';
       const reason = isAutoLogout ?
-        'You have been automatically logged out (session timeout)' :
-        'You have been logged out';
+        'You have been automatically logged out or timed out' :
+        'You have been sent to the login page';
 
+      markLogoutTelegramSent(alertKey);
       sendTelegramMessage(
         `🚪 <b>${logoutType} DETECTED!</b>\n\n` +
         `Player: ${state.playerName || 'Unknown'}\n` +
@@ -1256,9 +1646,7 @@ let logoutNotificationSent = false;
         '🔑 Please log back in to resume automation'
       );
 
-      // Trigger tab flash and browser notifications
       triggerLogoutAlerts();
-
       logoutNotificationSent = true;
       console.log('[Telegram] Logout notification sent');
       return true;
@@ -1268,6 +1656,380 @@ let logoutNotificationSent = false;
   }
 
   // END OF TELEGRAM FUNCTIONS
+
+
+  // ---------------------------
+  // Online Watch Alert Functions
+  // ---------------------------
+  function normalizeWatchName(name) {
+    return String(name || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  }
+
+  function getOnlineWatchAuthBasePath() {
+    const match = window.location.pathname.match(/^\/(authenticated)/i);
+    return match ? `/${match[1]}` : '/authenticated';
+  }
+
+  function getOnlineWatchUrl(path = 'players.aspx') {
+    const suffix = String(path).replace(/^\/?(authenticated\/)?/i, '');
+    return `${window.location.origin}${getOnlineWatchAuthBasePath()}/${suffix}`;
+  }
+
+  function isLikelyLoginDocument(doc) {
+    try {
+      const text = (doc.body?.textContent || '').toLowerCase();
+      return Boolean(
+        doc.querySelector('input[type="password"], input[name*="password" i], input[id*="password" i]') ||
+        (text.includes('login') && text.includes('password'))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function fetchOnlineWatchWithTimeout(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ONLINE_WATCH_FETCH_TIMEOUT_MS);
+    return fetch(url, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { 'X-TMN-Online-Watch': '1' }
+    }).finally(() => clearTimeout(timer));
+  }
+
+  async function fetchOnlineWatchPage() {
+    let lastError = null;
+
+    for (const path of ONLINE_WATCH_PAGE_CANDIDATES) {
+      const url = window.location.origin + path;
+      try {
+        const response = await fetchOnlineWatchWithTimeout(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        if (isLikelyLoginDocument(doc)) throw new Error('Looks logged out. Log in to TMN2010, then scan again.');
+        return { doc, url };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+
+    try {
+      const fallbackUrl = getOnlineWatchUrl('players.aspx');
+      const response = await fetchOnlineWatchWithTimeout(fallbackUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const html = await response.text();
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      if (isLikelyLoginDocument(doc)) throw new Error('Looks logged out. Log in to TMN2010, then scan again.');
+      return { doc, url: fallbackUrl };
+    } catch (err) {
+      lastError = err;
+    }
+
+    throw lastError || new Error('Could not fetch online players page.');
+  }
+
+  function parseOnlineWatchPlayers(doc) {
+    const map = new Map();
+    const links = Array.from(doc.querySelectorAll('a[href*="profile.aspx" i]'));
+
+    for (const link of links) {
+      const name = (link.textContent || '').trim().replace(/\s+/g, ' ');
+      const href = link.getAttribute('href') || '';
+      if (!name || name.length > 40) continue;
+      if (/^(profile|view|user|players|online|home|logout)$/i.test(name)) continue;
+
+      const idMatch = href.match(/[?&]id=(\d+)/i);
+      map.set(normalizeWatchName(name), {
+        name,
+        href: new URL(href, window.location.origin).href,
+        id: idMatch ? idMatch[1] : ''
+      });
+    }
+
+    return map;
+  }
+
+  function getCurrentOnlineWatchPlayers() {
+    try {
+      if (!/players\.aspx/i.test(window.location.pathname)) return null;
+      return parseOnlineWatchPlayers(document);
+    } catch {
+      return null;
+    }
+  }
+
+  function showOnlineWatchBrowserNotification(title, body, url) {
+    if (!onlineWatchConfig.browserNotify || !('Notification' in window)) return;
+
+    const showNotification = () => {
+      try {
+        const notification = new Notification(title, {
+          body,
+          requireInteraction: true,
+          icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+        });
+        notification.onclick = () => {
+          window.focus();
+          if (url) window.open(url, '_blank', 'noopener');
+          notification.close();
+        };
+      } catch (err) {
+        console.warn('[TMN][WATCH] Browser notification failed:', err);
+      }
+    };
+
+    if (Notification.permission === 'granted') {
+      showNotification();
+    } else if (Notification.permission === 'default') {
+      Notification.requestPermission().then(permission => {
+        if (permission === 'granted') showNotification();
+      }).catch(() => {});
+    }
+  }
+
+  function playOnlineWatchSound() {
+    if (!onlineWatchConfig.soundAlert) return;
+    try {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+
+      const ctx = new AudioContextClass();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.value = 880;
+      gain.gain.value = 0.08;
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start();
+
+      setTimeout(() => { osc.frequency.value = 660; }, 130);
+      setTimeout(() => {
+        try { osc.stop(); } catch {}
+        try { ctx.close(); } catch {}
+      }, 280);
+    } catch {}
+  }
+
+  function flashOnlineWatchTitle(name) {
+    if (!onlineWatchConfig.tabFlash) return;
+    if (onlineWatchTitleFlashTimer) clearInterval(onlineWatchTitleFlashTimer);
+
+    let count = 0;
+    onlineWatchTitleFlashTimer = setInterval(() => {
+      document.title = (count % 2 === 0) ? `🟢 ${name} ONLINE` : originalTitle;
+      count++;
+      if (count > 12) {
+        clearInterval(onlineWatchTitleFlashTimer);
+        onlineWatchTitleFlashTimer = null;
+        document.title = originalTitle;
+      }
+    }, 1000);
+  }
+
+  function shouldOnlineWatchAlert(key, isOnline) {
+    const wasOnline = Boolean(onlineWatchConfig.lastOnline[key]);
+    const lastAlert = Number(onlineWatchConfig.lastAlert[key] || 0);
+    const cooldownOk = Date.now() - lastAlert > ONLINE_WATCH_ALERT_COOLDOWN_MS;
+    return isOnline && (!wasOnline || cooldownOk);
+  }
+
+  function triggerOnlineWatchAlert(player) {
+    const key = normalizeWatchName(player.name);
+    onlineWatchConfig.lastAlert[key] = Date.now();
+    saveOnlineWatchConfig();
+
+    const message =
+      '🟢 <b>TMN2010 WATCH ALERT</b>\n\n' +
+      `${escapeHtml(player.name)} is <b>ONLINE</b>\n` +
+      `Player: ${escapeHtml(state.playerName || 'Unknown')}\n` +
+      `Time: ${formatDateUK()}` +
+      (player.href ? `\n${escapeHtml(player.href)}` : '');
+
+    showOnlineWatchBrowserNotification('TMN2010: player online', `${player.name} is online now`, player.href);
+    playOnlineWatchSound();
+    flashOnlineWatchTitle(player.name);
+
+    if (onlineWatchConfig.telegramNotify) {
+      sendTelegramMessage(message);
+    }
+
+    updateStatus(`🟢 Watch alert: ${player.name} online`);
+    console.log('[TMN][WATCH]', `${player.name} online`, player.href || '');
+  }
+
+  async function runOnlineWatchScan(reason = 'timer') {
+    if (!onlineWatchConfig.enabled) return;
+    if (!tabManager.isMasterTab) return; // prevents duplicate alerts in multiple tabs
+    if (onlineWatchInProgress) return;
+    if (!onlineWatchConfig.watchList.length) {
+      onlineWatchConfig.lastScanAt = Date.now();
+      onlineWatchConfig.lastScanOk = true;
+      onlineWatchConfig.lastScanMessage = 'Enabled, but no names in watch list';
+      saveOnlineWatchConfig();
+      renderOnlineWatchUI();
+      return;
+    }
+
+    onlineWatchInProgress = true;
+    renderOnlineWatchStatus('Scanning...', '#f59e0b');
+
+    try {
+      let onlineMap = getCurrentOnlineWatchPlayers();
+      let source = 'current page';
+
+      if (!onlineMap) {
+        const fetched = await fetchOnlineWatchPage();
+        onlineMap = parseOnlineWatchPlayers(fetched.doc);
+        source = fetched.url;
+      }
+
+      for (const rawName of onlineWatchConfig.watchList) {
+        const key = normalizeWatchName(rawName);
+        const hit = onlineMap.get(key);
+        const isOnline = Boolean(hit);
+
+        if (isOnline && shouldOnlineWatchAlert(key, true)) {
+          triggerOnlineWatchAlert(hit);
+        }
+
+        onlineWatchConfig.lastOnline[key] = isOnline;
+      }
+
+      onlineWatchConfig.lastScanAt = Date.now();
+      onlineWatchConfig.lastScanOk = true;
+      onlineWatchConfig.lastScanMessage = `OK: ${onlineMap.size} online parsed from ${source}`;
+      saveOnlineWatchConfig();
+      renderOnlineWatchUI();
+      console.log(`[TMN][WATCH] Scan complete (${reason}). ${onlineWatchConfig.lastScanMessage}`);
+    } catch (err) {
+      onlineWatchConfig.lastScanAt = Date.now();
+      onlineWatchConfig.lastScanOk = false;
+      onlineWatchConfig.lastScanMessage = err?.name === 'AbortError' ? 'Scan timed out' : (err?.message || String(err));
+      saveOnlineWatchConfig();
+      renderOnlineWatchUI();
+      console.warn('[TMN][WATCH] Scan failed:', err);
+    } finally {
+      onlineWatchInProgress = false;
+    }
+  }
+
+  function startOnlineWatchScheduler() {
+    stopOnlineWatchScheduler();
+    if (!onlineWatchConfig.enabled) {
+      renderOnlineWatchUI();
+      return;
+    }
+
+    const scanMs = Math.max(ONLINE_WATCH_MIN_SCAN_SECONDS, Number(onlineWatchConfig.scanSeconds || ONLINE_WATCH_DEFAULT_SCAN_SECONDS)) * 1000;
+    onlineWatchTimer = setInterval(() => runOnlineWatchScan('timer'), scanMs);
+    setTimeout(() => runOnlineWatchScan('startup'), 2500);
+    renderOnlineWatchUI();
+  }
+
+  function stopOnlineWatchScheduler() {
+    if (onlineWatchTimer) clearInterval(onlineWatchTimer);
+    onlineWatchTimer = null;
+  }
+
+  function addOnlineWatchPlayer(name) {
+    const clean = String(name || '').trim().replace(/\s+/g, ' ');
+    if (!clean) return alert('Enter a player name first.');
+
+    if (onlineWatchConfig.watchList.some(existing => normalizeWatchName(existing) === normalizeWatchName(clean))) {
+      return alert(`${clean} is already in the watch list.`);
+    }
+
+    if (onlineWatchConfig.watchList.length >= ONLINE_WATCH_MAX_NAMES) {
+      return alert(`Watch list limit is ${ONLINE_WATCH_MAX_NAMES} players.`);
+    }
+
+    onlineWatchConfig.watchList.push(clean);
+    onlineWatchConfig.lastOnline[normalizeWatchName(clean)] = false;
+    saveOnlineWatchConfig();
+    renderOnlineWatchUI();
+  }
+
+  function removeOnlineWatchPlayer(name) {
+    const key = normalizeWatchName(name);
+    onlineWatchConfig.watchList = onlineWatchConfig.watchList.filter(existing => normalizeWatchName(existing) !== key);
+    delete onlineWatchConfig.lastOnline[key];
+    delete onlineWatchConfig.lastAlert[key];
+    saveOnlineWatchConfig();
+    renderOnlineWatchUI();
+  }
+
+  function formatOnlineWatchLastScan() {
+    if (!onlineWatchConfig.lastScanAt) return 'Never scanned';
+    return `${formatDateUK(new Date(onlineWatchConfig.lastScanAt))} — ${onlineWatchConfig.lastScanMessage || ''}`;
+  }
+
+  function renderOnlineWatchStatus(text, color) {
+    if (!shadowRoot) return;
+    const statusEl = shadowRoot.querySelector('#tmn-online-watch-status');
+    if (statusEl) {
+      statusEl.innerHTML = `<span style="color:${color};">●</span> ${escapeHtml(text)}`;
+    }
+  }
+
+  function renderOnlineWatchUI() {
+    if (!shadowRoot) return;
+
+    const mainToggle = shadowRoot.querySelector('#tmn-online-watch-enabled');
+    if (mainToggle) mainToggle.checked = onlineWatchConfig.enabled;
+
+    const modalToggle = shadowRoot.querySelector('#tmn-online-watch-modal-enabled');
+    if (modalToggle) modalToggle.checked = onlineWatchConfig.enabled;
+
+    const listEl = shadowRoot.querySelector('#tmn-online-watch-list');
+    if (listEl) {
+      if (!onlineWatchConfig.watchList.length) {
+        listEl.innerHTML = '<div class="small text-muted">No watched players added yet.</div>';
+      } else {
+        listEl.innerHTML = onlineWatchConfig.watchList.map(name => {
+          const key = normalizeWatchName(name);
+          const isOnline = Boolean(onlineWatchConfig.lastOnline[key]);
+          const dotColor = isOnline ? '#22c55e' : '#ca8a04';
+          const statusText = isOnline ? 'Online' : 'Offline/unknown';
+          return `
+            <div class="tmn-watch-row" data-watch-name="${escapeHtml(name)}">
+              <span style="color:${dotColor}; font-size: 1rem;">●</span>
+              <span>${escapeHtml(name)} <small class="text-muted">(${statusText})</small></span>
+              <button type="button" class="btn btn-sm btn-outline-danger tmn-watch-remove" data-watch-name="${escapeHtml(name)}" style="padding:1px 6px;">×</button>
+            </div>
+          `;
+        }).join('');
+      }
+
+      listEl.querySelectorAll('.tmn-watch-remove').forEach(btn => {
+        btn.addEventListener('click', () => removeOnlineWatchPlayer(btn.getAttribute('data-watch-name')));
+      });
+    }
+
+    const statusText = onlineWatchConfig.lastScanOk ? formatOnlineWatchLastScan() : (onlineWatchConfig.lastScanMessage || 'Not scanned yet');
+    renderOnlineWatchStatus(statusText, onlineWatchConfig.lastScanOk ? '#10b981' : '#ef4444');
+
+    const secondsInput = shadowRoot.querySelector('#tmn-online-watch-seconds');
+    if (secondsInput) secondsInput.value = onlineWatchConfig.scanSeconds;
+
+    const browserCb = shadowRoot.querySelector('#tmn-online-watch-browser');
+    if (browserCb) browserCb.checked = onlineWatchConfig.browserNotify;
+
+    const tabCb = shadowRoot.querySelector('#tmn-online-watch-tabflash');
+    if (tabCb) tabCb.checked = onlineWatchConfig.tabFlash;
+
+    const soundCb = shadowRoot.querySelector('#tmn-online-watch-sound');
+    if (soundCb) soundCb.checked = onlineWatchConfig.soundAlert;
+
+    const telegramCb = shadowRoot.querySelector('#tmn-online-watch-telegram');
+    if (telegramCb) telegramCb.checked = onlineWatchConfig.telegramNotify;
+  }
+
 
   // ---------------------------
   // Auto-Resume Script Check Functions
@@ -2184,6 +2946,9 @@ let logoutNotificationSent = false;
 
   // Single unified watcher - no more separate OC/DTM/background watchers racing
   const MAIL_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds
+  const INVITE_STALE_MS = 15 * 60 * 1000; // Ignore OC/DTM invites older than 15 minutes
+  const SCRIPT_TEST_MAIL_STALE_MS = 5 * 60 * 1000; // Ignore stale Script test inbox alerts
+  const GM_GET_TIMEOUT_MS = 20000; // Prevent hung background requests from stalling automation
 
   // --- GM_xmlhttpRequest GET helper (returns html + finalUrl for redirect detection) ---
   function gmGet(url) {
@@ -2191,6 +2956,7 @@ let logoutNotificationSent = false;
       GM_xmlhttpRequest({
         method: "GET",
         url,
+        timeout: GM_GET_TIMEOUT_MS,
         headers: {
           'Cache-Control': 'no-cache, no-store',
           'Pragma': 'no-cache'
@@ -2204,6 +2970,7 @@ let logoutNotificationSent = false;
           }
         },
         onerror: (err) => reject(err),
+        ontimeout: () => reject(new Error(`Timeout after ${GM_GET_TIMEOUT_MS}ms for ${url}`)),
       });
     });
   }
@@ -2243,6 +3010,26 @@ let logoutNotificationSent = false;
     const [, dd, mm, yyyy, HH, MM, SS] = m;
     // Use UTC — TMN server times are in UTC, not local time
     return Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd), Number(HH), Number(MM), Number(SS || 0));
+  }
+
+
+  function isOlderThanMs(timestamp, maxAgeMs) {
+    return timestamp > 0 && timestamp < (Date.now() - maxAgeMs);
+  }
+
+  function shouldSkipUnparseableInvite(kind, mailId, lastSeen, storageKey) {
+    // If TMN changes the mailbox date format and we cannot parse the row time,
+    // do not treat pre-existing inbox rows as new invites on startup.
+    if (lastSeen) return parseInt(mailId, 10) <= parseInt(lastSeen, 10);
+    localStorage.setItem(storageKey, mailId);
+    console.log(`[TMN][MAIL] ${kind} invite skipped — no parseable date and no baseline yet; saved mailId=${mailId}`);
+    return true;
+  }
+
+  function isScriptTestInboxMessage(subject, rowText) {
+    const title = String(subject || '').trim();
+    const full = String(rowText || '');
+    return /^script\s*test$/i.test(title) || /\bscript\s*test\b/i.test(full);
   }
 
   // --- Find newest DTM invitation mail ---
@@ -2342,11 +3129,18 @@ let logoutNotificationSent = false;
 
   // All tracking is now via localStorage - no in-memory state that gets wiped on page nav
 
+  let unifiedMailCheckInProgress = false;
+
   async function unifiedMailCheck() {
+    if (unifiedMailCheckInProgress) {
+      console.log('[TMN][MAIL] Previous mail check still in progress — skipping overlap');
+      return;
+    }
+    unifiedMailCheckInProgress = true;
     try {
       if (!tabManager.isMasterTab) return;
-      // Need at least OC/DTM enabled or telegram messages enabled
-      if (!state.autoOC && !state.autoDTM && !(telegramConfig.enabled && telegramConfig.notifyMessages)) return;
+      // Need at least OC/DTM enabled or a Telegram inbox/mail alert enabled
+      if (!state.autoOC && !state.autoDTM && !(telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck))) return;
 
       const inboxURL = `${location.origin}/authenticated/mailbox.aspx?p=m`;
       const inboxRes = await gmGet(inboxURL);
@@ -2453,18 +3247,18 @@ let logoutNotificationSent = false;
             continue;
           }
 
-          // DEDUP LAYER 4: Age check — skip if mail is older than 2 minutes
+          // DEDUP LAYER 4: Age check — skip if mail is 15 minutes old or older
           const inviteTs = parseTMNDateFromText(rowText);
-          const fifteenMinAgo = Date.now() - (15 * 60 * 1000);
-          if (inviteTs > 0 && inviteTs < fifteenMinAgo) {
-            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 4 (older than 15min) — age: ${Math.round((Date.now() - inviteTs) / 60000)}min`);
+          if (isOlderThanMs(inviteTs, INVITE_STALE_MS)) {
+            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 4 (15min+ old) — age: ${Math.round((Date.now() - inviteTs) / 60000)}min`);
             localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
             continue;
           }
 
-          // DEDUP LAYER 5: If we can't parse the date, only accept if mail ID is HIGHER than last seen
-          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
-            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 5 (ID ordering) — mailId=${mailId} lastSeen=${lastSeen}`);
+          // DEDUP LAYER 5: If we can't parse the date, only accept mail IDs higher than an existing baseline.
+          // With no baseline, save this row as seen and skip it so old inbox rows cannot be processed on startup.
+          if (inviteTs === 0 && shouldSkipUnparseableInvite('DTM', mailId, lastSeen, LS_LAST_DTM_INVITE_MAIL_ID)) {
+            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 5 (unparseable/baseline) — mailId=${mailId} lastSeen=${lastSeen || 'none'}`);
             continue;
           }
 
@@ -2503,18 +3297,18 @@ let logoutNotificationSent = false;
             continue;
           }
 
-          // DEDUP LAYER 4: Age check — skip if mail is older than 2 minutes
+          // DEDUP LAYER 4: Age check — skip if mail is 15 minutes old or older
           const inviteTs = parseTMNDateFromText(rowText);
-          const fifteenMinAgo = Date.now() - (15 * 60 * 1000);
-          if (inviteTs > 0 && inviteTs < fifteenMinAgo) {
-            console.log(`[TMN][MAIL] OC invite skipped — older than 15min (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
+          if (isOlderThanMs(inviteTs, INVITE_STALE_MS)) {
+            console.log(`[TMN][MAIL] OC invite skipped — 15min+ old (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
             localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
             continue;
           }
 
-          // DEDUP LAYER 5: If date unparseable, only accept if mail ID is higher than last seen
-          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
-            console.log(`[TMN][MAIL] OC invite skipped — mail ID ${mailId} <= last seen ${lastSeen} (unparseable date)`);
+          // DEDUP LAYER 5: If date unparseable, only accept if mail ID is higher than an existing baseline.
+          // With no baseline, save this row as seen and skip it so old inbox rows cannot be processed on startup.
+          if (inviteTs === 0 && shouldSkipUnparseableInvite('OC', mailId, lastSeen, LS_LAST_OC_INVITE_MAIL_ID)) {
+            console.log(`[TMN][MAIL] OC invite skipped — unparseable date/baseline mailId=${mailId} lastSeen=${lastSeen || 'none'}`);
             continue;
           }
 
@@ -2522,6 +3316,65 @@ let logoutNotificationSent = false;
           console.log(`[TMN][MAIL] ✅ OC invite PASSED dedup! id=${mailId} subject="${subject}"`);
           await handleNewOCInvite(mailId, href);
           continue;
+        }
+
+        // Inbox "Script test" alert — mirrors staff script check urgency and repeats 5 times.
+        // Uses its own high-water mark so it works even if general "New Messages" alerts are off.
+        if (telegramConfig.enabled && telegramConfig.notifyInboxScriptTest && isScriptTestInboxMessage(subject, rowText)) {
+          const lastScriptTestMailId = GM_getValue('lastScriptTestMailId', 0);
+          const numericMailId = parseInt(mailId, 10) || 0;
+          if (numericMailId > Number(lastScriptTestMailId || 0)) {
+            GM_setValue('lastScriptTestMailId', numericMailId);
+
+            const scriptTestTs = parseTMNDateFromText(rowText);
+            if (isOlderThanMs(scriptTestTs, SCRIPT_TEST_MAIL_STALE_MS)) {
+              console.log(`[TMN][MAIL] Script test alert skipped — older than 5min id=${mailId}`);
+              continue;
+            }
+
+            console.log(`[TMN][MAIL] Script test inbox title detected — alerting 5x id=${mailId}`);
+            sendScriptTestInboxAlert(mailId, sender, subject);
+            continue;
+          }
+        }
+
+        // SQL/Stipe staff mail alert — catches staff checks delivered as normal inbox messages.
+        // Separate high-water mark prevents repeats and works even when general new-message alerts are off.
+        if (telegramConfig.enabled && telegramConfig.notifyStaffMailCheck) {
+          const lastStaffMailId = GM_getValue('lastStaffScriptMailId', null);
+          const numericMailId = parseInt(mailId, 10) || 0;
+
+          // First run: baseline the mailbox so old SQL/Stipe messages do not spam Telegram after update/install.
+          if (lastStaffMailId === null) {
+            let maxId = 0;
+            for (const row of rows) {
+              const rowLink = [...row.querySelectorAll('a[href*="mailbox.aspx"]')].find(a =>
+                /[?&]id=\d+/i.test(a.getAttribute("href") || "")
+              );
+              if (rowLink) {
+                const rid = parseInt(parseMailIdFromHref(rowLink.getAttribute("href") || ""), 10) || 0;
+                if (rid > maxId) maxId = rid;
+              }
+            }
+            GM_setValue('lastStaffScriptMailId', maxId);
+            console.log(`[TMN][MAIL] First run — initialized lastStaffScriptMailId to ${maxId}`);
+          } else if (numericMailId > Number(lastStaffMailId || 0)) {
+            const mailTs = parseTMNDateFromText(rowText);
+            if (isOlderThanMs(mailTs, INVITE_STALE_MS)) {
+              GM_setValue('lastStaffScriptMailId', numericMailId);
+              console.log(`[TMN][MAIL] SQL/Stipe staff mail skipped — 15min+ old id=${mailId}`);
+            } else if (isSqlOrStipeSender(sender) || hasSqlOrStipeStaffSignal(sender, subject, rowText)) {
+              GM_setValue('lastStaffScriptMailId', numericMailId);
+              let mailContent = '';
+              try { mailContent = await fetchMailContentById(href) || ''; } catch (e) { mailContent = ''; }
+
+              if (isSqlOrStipeSender(sender) || hasSqlOrStipeStaffSignal(sender, subject, rowText, mailContent)) {
+                console.log(`[TMN][MAIL] SQL/Stipe staff mail detected — alerting 5x id=${mailId}`);
+                sendStaffMailCheckAlert(mailId, sender, subject, mailContent);
+                continue;
+              }
+            }
+          }
         }
 
         // Regular mail - check against last notified ID stored in GM storage (persists reliably)
@@ -2567,8 +3420,8 @@ let logoutNotificationSent = false;
               sendTelegramMessage(
                 `📬 <b>New Message!</b>\n\n` +
                 `Player: ${state.playerName || 'Unknown'}\n` +
-                `From: ${sender}\n` +
-                `Subject: ${subject}` +
+                `From: ${escapeHtml(sender)}\n` +
+                `Subject: ${escapeHtml(subject)}` +
                 contentPreview
               );
             } catch (e) {
@@ -2576,8 +3429,8 @@ let logoutNotificationSent = false;
               sendTelegramMessage(
                 `📬 <b>New Message!</b>\n\n` +
                 `Player: ${state.playerName || 'Unknown'}\n` +
-                `From: ${sender}\n` +
-                `Subject: ${subject}`
+                `From: ${escapeHtml(sender)}\n` +
+                `Subject: ${escapeHtml(subject)}`
               );
             }
 
@@ -2588,6 +3441,8 @@ let logoutNotificationSent = false;
 
     } catch (e) {
       console.warn("[TMN][MAIL] unifiedMailCheck error:", e);
+    } finally {
+      unifiedMailCheckInProgress = false;
     }
   }
 
@@ -2849,12 +3704,14 @@ let logoutNotificationSent = false;
       if (retryUrl) {
         console.log('[TMN][AUTO-OC] Not on OC page, re-navigating to accept URL');
         localStorage.removeItem(LS_PENDING_OC_URL);
-        try {
-          const u = new URL(retryUrl);
-          window.location.href = u.pathname + u.search;
-        } catch {
-          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
-        }
+        scheduleOCDTMAction('Re-opening OC invite', () => {
+          try {
+            const u = new URL(retryUrl);
+            window.location.href = u.pathname + u.search;
+          } catch {
+            window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+          }
+        });
         return true;
       }
       return false;
@@ -2862,6 +3719,8 @@ let logoutNotificationSent = false;
 
     console.log('[TMN][AUTO-OC] On OC page — handling role selection...');
     state.isPerformingAction = true;
+    state.currentAction = 'oc';
+    GM_setValue('actionStartTime', Date.now());
 
     // 1) Check if there's still an Accept link to click
     const acceptLink = Array.from(document.querySelectorAll("a"))
@@ -2873,7 +3732,7 @@ let logoutNotificationSent = false;
 
     if (acceptLink) {
       console.log('[TMN][AUTO-OC] Clicking Accept link on page');
-      setTimeout(() => acceptLink.click(), randomDelay(DELAYS.quick));
+      scheduleOCDTMAction('Clicking OC accept link', () => acceptLink.click());
       return true;
     }
 
@@ -2912,7 +3771,7 @@ let logoutNotificationSent = false;
       const btn = document.getElementById(id);
       if (btn && !btn.disabled) {
         console.log(`[TMN][AUTO-OC] Clicking role button: ${id}`);
-        setTimeout(() => {
+        scheduleOCDTMAction('Selecting OC role item', () => {
           btn.click();
           localStorage.removeItem('tmnPendingOCHandle');
           state.isPerformingAction = false;
@@ -2922,7 +3781,7 @@ let logoutNotificationSent = false;
             `Player: ${state.playerName || 'Unknown'}\n` +
             '✅ Automation resumed'
           );
-        }, 2000);
+        });
         return true;
       }
     }
@@ -2939,12 +3798,12 @@ let logoutNotificationSent = false;
 
     if (fallbackBtn) {
       console.log(`[TMN][AUTO-OC] Clicking fallback button: ${fallbackBtn.id || fallbackBtn.value}`);
-      setTimeout(() => {
+      scheduleOCDTMAction('Selecting OC fallback role item', () => {
         fallbackBtn.click();
         localStorage.removeItem('tmnPendingOCHandle');
         state.isPerformingAction = false;
         updateStatus("✅ OC role selected — resuming automation");
-      }, 2000);
+      });
       return true;
     }
 
@@ -3006,12 +3865,14 @@ let logoutNotificationSent = false;
       if (retryUrl) {
         console.log('[TMN][AUTO-DTM] Not on DTM page, re-navigating to accept URL');
         localStorage.removeItem(LS_PENDING_DTM_URL);
-        try {
-          const u = new URL(retryUrl);
-          window.location.href = u.pathname + u.search;
-        } catch {
-          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
-        }
+        scheduleOCDTMAction('Re-opening DTM invite', () => {
+          try {
+            const u = new URL(retryUrl);
+            window.location.href = u.pathname + u.search;
+          } catch {
+            window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+          }
+        });
         return true;
       }
       return false;
@@ -3020,6 +3881,8 @@ let logoutNotificationSent = false;
     console.log('[TMN][AUTO-DTM] On DTM page — handling...');
     console.log(`[TMN][AUTO-DTM] Page text snippet: "${(document.body.textContent || "").substring(0, 200)}"`);
     state.isPerformingAction = true;
+    state.currentAction = 'dtm';
+    GM_setValue('actionStartTime', Date.now());
 
     // Wait briefly for page to fully render (ASP.NET forms can load elements async)
     if (!document.getElementById('ctl00_main_btnBuyDrugs') &&
@@ -3042,7 +3905,7 @@ let logoutNotificationSent = false;
 
     if (completeBtn && !completeBtn.disabled) {
       console.log('[TMN][AUTO-DTM] Clicking Complete DTM');
-      setTimeout(() => {
+      scheduleOCDTMAction('Completing DTM', () => {
         completeBtn.click();
         localStorage.removeItem('tmnPendingDTMHandle');
         localStorage.setItem(LS_LAST_DTM_ACCEPT_TS, String(Date.now())); // Cooldown starts on COMPLETION only
@@ -3058,7 +3921,7 @@ let logoutNotificationSent = false;
           `Player: ${state.playerName || 'Unknown'}\n` +
           '✅ 2h cooldown started, automation resumed'
         );
-      }, 2000);
+      });
       return true;
     }
 
@@ -3148,7 +4011,7 @@ let logoutNotificationSent = false;
     if (maxAmount > 0 && drugInput && buyButton && !buyButton.disabled) {
       drugInput.value = String(maxAmount);
       console.log(`[TMN][AUTO-DTM] Buying ${maxAmount} drugs`);
-      setTimeout(() => {
+      scheduleOCDTMAction(`Buying ${maxAmount} DTM drugs`, () => {
         buyButton.click();
 
         // Set cooldown (buying drugs completes the DTM in some setups)
@@ -3171,7 +4034,7 @@ let logoutNotificationSent = false;
           `Amount: ${maxAmount}\n` +
           '✅ 2h cooldown started, automation resumed'
         );
-      }, randomDelay(DELAYS.quick));
+      });
       return true;
     }
 
@@ -3179,7 +4042,7 @@ let logoutNotificationSent = false;
     if (drugInput && buyButton && !buyButton.disabled && drugInput.value && parseInt(drugInput.value) > 0) {
       const prefilledAmount = drugInput.value;
       console.log(`[TMN][AUTO-DTM] Input already has value: ${prefilledAmount}, clicking Buy`);
-      setTimeout(() => {
+      scheduleOCDTMAction(`Buying prefilled DTM drugs (${prefilledAmount})`, () => {
         buyButton.click();
         const now = Date.now();
         storeDTMTimerData({
@@ -3190,7 +4053,7 @@ let logoutNotificationSent = false;
         localStorage.removeItem('tmnPendingDTMHandleTs');
         state.isPerformingAction = false;
         updateStatus("✅ DTM drugs bought — resuming automation");
-      }, randomDelay(DELAYS.quick));
+      });
       return true;
     }
 
@@ -3857,7 +4720,7 @@ let logoutNotificationSent = false;
         const sellAmount = Math.min(config.boozeSellAmount, currentInventory);
         sellInput.value = sellAmount;
         updateStatus(`Selling ${sellAmount} booze units...`);
-        sellBtn.click();
+        submitAspNetButton(sellBtn);
 
         state.lastBooze = now;
         state.needsRefresh = true;
@@ -4026,6 +4889,7 @@ let logoutNotificationSent = false;
       if (buyBtn) {
         state.isPerformingAction = true;
         state.currentAction = 'health';
+        GM_setValue('actionStartTime', Date.now());
         console.log(`[TMN] Buying health - current: ${health}%`);
         updateStatus(`Buying health (${health}% -> ${Math.min(100, health + 10)}%)`);
         buyBtn.click();
@@ -4034,6 +4898,7 @@ let logoutNotificationSent = false;
         setTimeout(() => {
           state.isPerformingAction = false;
           state.currentAction = '';
+          GM_setValue('actionStartTime', 0);
           state.lastHealth = Date.now();
           // Check if we need more health
           if (health + 10 >= 100) {
@@ -4120,6 +4985,92 @@ let logoutNotificationSent = false;
     if (!normName) return false;
     const known = KNOWN_CARS.find(c => _normalizeCarName(c.name) === normName);
     return !!(known && known.manual);
+  }
+
+
+  // Robust garage row parser. TMN has changed garage table column order before,
+  // so do not rely on row.children[1] for the car name or row.children[4] for damage.
+  // This finds the known car model anywhere in the row text and extracts the first
+  // percentage-looking value as damage. It also keeps a safe fallback for unknown cars.
+  function escapeRegExp(str) {
+    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function getGarageRowInfo(row) {
+    const text = (row ? row.textContent : '').replace(/\s+/g, ' ').trim();
+    const cells = row ? Array.from(row.children) : [];
+    let carName = '';
+
+    // Prefer exact known model names found in the whole row. Sort longest first so
+    // a shorter name cannot win over a longer specific model.
+    const knownHit = KNOWN_CARS
+      .slice()
+      .sort((a, b) => b.name.length - a.name.length)
+      .find(car => new RegExp(`(^|\\b)${escapeRegExp(car.name)}($|\\b)`, 'i').test(text));
+    if (knownHit) {
+      carName = knownHit.name;
+    } else {
+      // Fallback: use the first non-checkbox cell that looks like text rather than
+      // money, damage, location-only, or an action column.
+      for (const cell of cells) {
+        const t = (cell.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!t) continue;
+        if (/^\d+%$/.test(t)) continue;
+        if (/^\$?[\d,]+$/.test(t)) continue;
+        if (/^(sell|repair|crush|location|value|damage)$/i.test(t)) continue;
+        if (cell.querySelector('input[type="checkbox"]')) continue;
+        carName = t;
+        break;
+      }
+    }
+
+    let damage = 0;
+    const pctMatch = text.match(/(\d{1,3})\s*%/);
+    if (pctMatch) damage = Math.max(0, Math.min(100, parseInt(pctMatch[1], 10) || 0));
+
+    return {
+      carName,
+      damage,
+      checkbox: row ? row.querySelector('input[type="checkbox"]') : null,
+      text
+    };
+  }
+
+  function setGarageCheckboxChecked(cb, checked) {
+    if (!cb) return;
+    cb.checked = !!checked;
+    // ASP.NET pages and custom JS sometimes read change/click state rather than
+    // only the property, so dispatch both lightweight events after changing it.
+    try { cb.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
+    try { cb.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+  }
+
+  function submitAspNetButton(btn) {
+    if (!btn) return false;
+    try {
+      const form = btn.form || document.forms[0];
+      const name = btn.getAttribute('name');
+      if (form && name) {
+        const prev = form.querySelector('input[data-tmn-submit="1"]');
+        if (prev) prev.remove();
+        const hidden = document.createElement('input');
+        hidden.type = 'hidden';
+        hidden.name = name;
+        hidden.value = btn.value || btn.textContent || '';
+        hidden.setAttribute('data-tmn-submit', '1');
+        form.appendChild(hidden);
+        if (typeof form.requestSubmit === 'function') {
+          form.requestSubmit(btn);
+        } else {
+          form.submit();
+        }
+        return true;
+      }
+    } catch (e) {
+      console.warn('[TMN] ASP.NET button submit fallback failed, using click:', e);
+    }
+    btn.click();
+    return true;
   }
 
   // ---------------------------
@@ -4285,17 +5236,14 @@ let logoutNotificationSent = false;
     GM_setValue('actionStartTime', now);
 
     // Step 1a: Send crusher cars to crusher
-    // Gated on: Auto Crusher toggle on, crusherOwned not explicitly false
+    // Gated on: Auto Crusher toggle on, crusherOwned not explicitly false.
+    // v17.20 restores the v17.13 one-car-at-a-time crusher submit flow.
     if (state.autoCrusher && state.crusherOwned !== false) {
-      // Detect crusher ownership: the button is ALWAYS present on the garage page,
-      // but is rendered with the `disabled` attribute when the player doesn't own a crusher.
-      // We must check both: element exists AND it's not disabled.
       const crusherBtnCheck = document.getElementById('ctl00_main_btnSendtoCrusher');
       const crusherBtnUsable = crusherBtnCheck &&
                                !crusherBtnCheck.disabled &&
                                !crusherBtnCheck.hasAttribute('disabled');
       if (!crusherBtnUsable) {
-        // Button absent OR disabled → definitely no crusher. Permanently disable.
         const reason = !crusherBtnCheck
           ? 'crusher button missing from garage page'
           : 'crusher button present but disabled (no crusher owned)';
@@ -4427,18 +5375,17 @@ let logoutNotificationSent = false;
           let chosenRow = null;
           let chosenName = '';
           for (const row of carRows) {
-            const nameCell = row.children[1];
-            const carName = nameCell ? nameCell.textContent.trim() : '';
-            const damageCell = row.children[4];
-            const damage = damageCell ? parseInt(damageCell.textContent.trim().replace('%', ''), 10) : 0;
-            const checkbox = row.querySelector('input[type="checkbox"]');
-            // Skip: missing checkbox, manual-only cars, non-crusher cars, OC cars,
-            // undamaged cars, models currently on a gifted cooldown
-            if (!checkbox) continue;
+            const info = getGarageRowInfo(row);
+            const carName = info.carName;
+            const checkbox = info.checkbox;
+            // Skip: missing checkbox/name, manual-only cars, non-crusher cars, OC cars,
+            // models currently on a gifted cooldown. A user-selected Crush category now
+            // means "try crusher" regardless of parsed damage; the previous fixed-column
+            // damage check could wrongly skip selected cars when the table layout changed.
+            if (!checkbox || !carName) continue;
             if (isManualOnlyCar(carName)) continue;
             if (!isCrusherCar(carName)) continue;
             if (isVIPCar(carName)) continue;
-            if (damage <= 0) continue;
             if (isModelOnGiftedCooldown(carName)) continue;
             chosenRow = row;
             chosenName = carName;
@@ -4451,17 +5398,18 @@ let logoutNotificationSent = false;
             // UnderCoverLover reported seeing 3 boxes ticked when the script intended 1,
             // so we belt-and-braces this.
             const allTableCheckboxes = table.querySelectorAll('input[type="checkbox"]');
-            allTableCheckboxes.forEach(cb => { cb.checked = false; });
+            allTableCheckboxes.forEach(cb => setGarageCheckboxChecked(cb, false));
 
             const cb = chosenRow.querySelector('input[type="checkbox"]');
-            if (cb) cb.checked = true;
+            if (cb) setGarageCheckboxChecked(cb, true);
 
             // Verify we have EXACTLY one ticked checkbox before clicking. If the count
             // is wrong, abort and log loudly — this prevents a multi-car submission
             // which would trigger TMN's "you can only crush cars that you stole yourself"
             // error if any of the unintended cars happened to be gifted.
-            const tickedCount = Array.from(table.querySelectorAll('input[type="checkbox"]'))
-              .filter(c => c.checked).length;
+            const tickedCount = carRows
+              .map(r => r.querySelector('input[type="checkbox"]'))
+              .filter(c => c && c.checked).length;
             if (tickedCount !== 1) {
               console.warn(`[TMN] ⚠️ Crusher safety abort — expected exactly 1 ticked checkbox, found ${tickedCount}. Skipping this crush cycle.`);
               updateStatus(`Crusher: aborted (${tickedCount} boxes ticked, expected 1)`);
@@ -4474,9 +5422,9 @@ let logoutNotificationSent = false;
               } catch (e) {
                 console.warn('[TMN] Failed to stash pending crush name:', e);
               }
-              updateStatus(`Sending ${chosenName} to crusher...`);
+              updateStatus(`Sending ${chosenName} to crusher.`);
               console.log(`[TMN] Sending 1 car to crusher: ${chosenName}`);
-              crusherBtnCheck.click();
+              submitAspNetButton(crusherBtnCheck);
               setTimeout(() => {
                 state.isPerformingAction = false;
                 state.currentAction = '';
@@ -4498,8 +5446,7 @@ let logoutNotificationSent = false;
     //  - Anything that isn't an OC car AND isn't a manual-only car (e.g. Bugatti Chiron SS)
     //  - Crush-category cars are sold ONLY if Auto Crusher is off, OR the model is on
     //    a gifted cooldown (meaning a previous crush attempt failed),
-    //    OR they have 0% damage (the crusher won't accept undamaged cars)
-    // Step 1b: Sell remaining cars.
+      // Step 1b: Sell remaining cars.
     // Behaviour depends on whether we've confirmed no crusher:
     //  - crusherOwned !== false (own one OR status unknown): keep all listed cars
     //    (OC, Chiron, crusher cars) — only sell unlisted cars like random Nissans.
@@ -4508,35 +5455,35 @@ let logoutNotificationSent = false;
     //    there's no point keeping them. OC cars and Chiron still kept.
     //  - Damaged crusher cars that hit the gifted cooldown are always sold regardless.
     const crusherConfirmedNone = state.crusherOwned === false;
+    // Start sell phase from a clean checkbox state so a manually ticked row or a
+    // previous aborted crusher attempt cannot be sold by accident.
+    table.querySelectorAll('input[type="checkbox"]').forEach(cb => setGarageCheckboxChecked(cb, false));
     let carsToSell = 0;
     carRows.forEach(row => {
-      const nameCell = row.children[1];
-      const carName = nameCell ? nameCell.textContent.trim() : '';
-      const damageCell = row.children[4];
-      const damage = damageCell ? parseInt(damageCell.textContent.trim().replace('%', ''), 10) : 0;
-      const checkbox = row.querySelector('input[type="checkbox"]');
+      const info = getGarageRowInfo(row);
+      const carName = info.carName;
+      const checkbox = info.checkbox;
       if (!checkbox) return;
       if (isVIPCar(carName)) return;        // OC cars: always keep
       if (isManualOnlyCar(carName)) return; // Bugatti Chiron SS: always keep (manual)
       if (isCrusherCar(carName)) {
         // Gifted cooldown → always sell (we can't crush it right now anyway)
         if (isModelOnGiftedCooldown(carName)) {
-          checkbox.checked = true;
+          setGarageCheckboxChecked(checkbox, true);
           carsToSell++;
           return;
         }
         // No crusher confirmed → sell it, no point hoarding
         if (crusherConfirmedNone) {
-          checkbox.checked = true;
+          setGarageCheckboxChecked(checkbox, true);
           carsToSell++;
           return;
         }
-        // Otherwise keep crusher cars (damaged ones are handled by Step 1a;
-        // undamaged ones are stockpiled for when they eventually take damage)
+        // Otherwise keep crusher cars; Step 1a handles the first eligible Crush-category car.
         return;
       }
       // Unlisted car — sell it
-      checkbox.checked = true;
+      setGarageCheckboxChecked(checkbox, true);
       carsToSell++;
     });
     if (carsToSell > 0) {
@@ -4544,7 +5491,7 @@ let logoutNotificationSent = false;
       if (sellBtn) {
         updateStatus(`Selling ${carsToSell} non-VIP cars...`);
         console.log(`[TMN] Selling ${carsToSell} non-VIP cars`);
-        sellBtn.click();
+        submitAspNetButton(sellBtn);
         setTimeout(() => {
           state.isPerformingAction = false;
           state.currentAction = '';
@@ -4560,18 +5507,17 @@ let logoutNotificationSent = false;
 
     // Step 2: Repair damaged VIP cars (one at a time)
     for (const row of carRows) {
-      const nameCell = row.children[1];
-      const carName = nameCell ? nameCell.textContent.trim() : '';
-      const damageCell = row.children[4];
-      const damage = damageCell ? parseInt(damageCell.textContent.trim().replace('%', ''), 10) : 0;
-      const checkbox = row.querySelector('input[type="checkbox"]');
+      const info = getGarageRowInfo(row);
+      const carName = info.carName;
+      const damage = info.damage;
+      const checkbox = info.checkbox;
 
       if (checkbox && isVIPCar(carName) && damage > 0) {
         // Uncheck EVERY checkbox in the table (including Check All header) first
         const allTableCheckboxes = table.querySelectorAll('input[type="checkbox"]');
-        allTableCheckboxes.forEach(cb => { cb.checked = false; });
+        allTableCheckboxes.forEach(cb => setGarageCheckboxChecked(cb, false));
 
-        checkbox.checked = true;
+        setGarageCheckboxChecked(checkbox, true);
 
         // Verify exactly one ticked before clicking — same defence as Step 1a
         const tickedCount = Array.from(table.querySelectorAll('input[type="checkbox"]'))
@@ -4586,7 +5532,7 @@ let logoutNotificationSent = false;
         if (repairBtn) {
           updateStatus(`Repairing VIP car: ${carName} (${damage}% damage)`);
           console.log(`[TMN] Repairing VIP car: ${carName}`);
-          repairBtn.click();
+          submitAspNetButton(repairBtn);
 
           // Reset state and continue automation
           setTimeout(() => {
@@ -4862,9 +5808,11 @@ let logoutNotificationSent = false;
     const onOCPage = /\/authenticated\/organizedcrime\.aspx/i.test(location.pathname) &&
                      !/p=dtm/i.test(location.search);
     if (onOCPage) {
-      setTimeout(() => handleCreateOCPage(), 600);
+      scheduleOCDTMAction('Opening OC creation handler', () => handleCreateOCPage());
     } else {
-      window.location.href = OC_URL + '?' + Date.now();
+      scheduleOCDTMAction('Opening OC creation page', () => {
+        window.location.href = OC_URL + '?' + Date.now();
+      });
     }
   }
 
@@ -4920,7 +5868,7 @@ let logoutNotificationSent = false;
         const commitBtn = document.getElementById('ctl00_main_btnCommitOC');
         if (commitBtn && !commitBtn.disabled) {
           console.log('[TMN][CreateOC] Polling: Commit button ready — submitting!');
-          await humanDelay(randomDelay(DELAYS.normal));
+          await waitOCDTMActionDelay('OC/DTM action');
           formSubmitButton(commitBtn);
 
           // Determine whether to continue or stop based on repeat mode
@@ -5036,7 +5984,7 @@ let logoutNotificationSent = false;
         const typeName = startBtn.id.includes('Casino') ? 'Casino'
                        : startBtn.id.includes('Armoury') ? 'Armoury' : 'Bank';
         console.log(`[TMN][CreateOC] Step 0: Starting OC — ${typeName}`);
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         sendTelegramMessage(
           `🏢 <b>OC Step 1/5</b>\n\nLeader: ${username}\n` +
           `Started OC (${typeName})`
@@ -5061,13 +6009,13 @@ let logoutNotificationSent = false;
         }
         console.log('[TMN][CreateOC] Step 1: Clearing field');
         nameInput.value = '';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 1: Enter ' + transporter);
         nameInput.value = transporter;
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 1: Select Transporter');
         roleSelect.value = 'Transporter';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 1: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 2/5</b>\n\nLeader: ${username}\n` +
@@ -5093,13 +6041,13 @@ let logoutNotificationSent = false;
         }
         console.log('[TMN][CreateOC] Step 2: Clearing field');
         nameInput.value = '';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 2: Enter ' + weaponMaster);
         nameInput.value = weaponMaster;
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 2: Select WeaponMaster');
         roleSelect.value = 'WeaponMaster';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 2: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 3/5</b>\n\nLeader: ${username}\n` +
@@ -5124,13 +6072,13 @@ let logoutNotificationSent = false;
         }
         console.log('[TMN][CreateOC] Step 3: Clearing field');
         nameInput.value = '';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 3: Enter ' + explosiveExpert);
         nameInput.value = explosiveExpert;
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 3: Select ExplosiveExpert');
         roleSelect.value = 'ExplosiveExpert';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
         console.log('[TMN][CreateOC] Step 3: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 4/5</b>\n\nLeader: ${username}\n` +
@@ -5177,7 +6125,7 @@ let logoutNotificationSent = false;
 
         console.log('[TMN][CreateOC] Step 4: Select Laptop');
         secSelect.value = '6';
-        await humanDelay(randomDelay(DELAYS.normal));
+        await waitOCDTMActionDelay('OC/DTM action');
 
         console.log('[TMN][CreateOC] Step 4: Click Buy');
         sendTelegramMessage(
@@ -5200,8 +6148,9 @@ let logoutNotificationSent = false;
     return false;
   }
 
-  // Helper for humanDelay used in OC creation
-  function humanDelay(ms) {
+  // Millisecond sleep helper for OC creation. Kept separate so it does not
+  // overwrite the main humanDelay(range) helper used by action timing.
+  function sleepMs(ms) {
     return new Promise(resolve => setTimeout(resolve, typeof ms === 'number' ? ms : 1000));
   }
 
@@ -5260,6 +6209,18 @@ let logoutNotificationSent = false;
         min-width: 70px;
         display: inline-block;
       }
+      .tmn-watch-row {
+        display: grid;
+        grid-template-columns: 18px 1fr auto;
+        gap: 7px;
+        align-items: center;
+        padding: 6px;
+        background: rgba(0,0,0,0.18);
+        border: 1px solid #263244;
+        border-radius: 5px;
+        margin-bottom: 5px;
+        font-size: 0.82rem;
+      }
     `;
     shadowRoot.appendChild(style);
 
@@ -5268,7 +6229,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.10</strong>
+          <strong>TMN TDS Auto v17.20</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -5331,6 +6292,10 @@ let logoutNotificationSent = false;
               <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-whitelist-enabled">
                 <label class="form-check-label" for="tmn-whitelist-enabled" id="tmn-whitelist-label" style="cursor:pointer; text-decoration:underline; color:#60a5fa;">Whitelist</label>
+              </div>
+              <div class="form-check form-switch" style="grid-column: 1 / span 2;">
+                <input class="form-check-input" type="checkbox" id="tmn-online-watch-enabled">
+                <label class="form-check-label" for="tmn-online-watch-enabled" id="tmn-online-watch-label" style="cursor:pointer; text-decoration:underline; color:#60a5fa;">🟢 Online Watch Alerts</label>
               </div>
           </div>
           <div id="tmn-player-badge" style="font-size:0.85rem;color:#9ca3af;">Player: ${state.playerName || 'Unknown'}</div>
@@ -5521,6 +6486,39 @@ let logoutNotificationSent = false;
               </div>
 
               <hr style="border-color:#1f2937">
+              <h6 style="color:#cbd5e1;">Online Watch Alerts</h6>
+              <div class="mb-3">
+                <small class="text-muted d-block mb-2">Watch up to 10 player names and alert when they appear online on the players page.</small>
+                <div class="form-check form-switch mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-online-watch-modal-enabled">
+                  <label class="form-check-label" for="tmn-online-watch-modal-enabled">Enable Online Watch</label>
+                </div>
+                <div class="mb-2">
+                  <label class="form-label small">Scan interval (sec):</label>
+                  <input type="number" id="tmn-online-watch-seconds" class="form-control form-control-sm tmn-compact-input" value="${onlineWatchConfig.scanSeconds}" min="20" max="3600">
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-online-watch-browser">
+                  <label class="form-check-label" for="tmn-online-watch-browser">Browser notification</label>
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-online-watch-tabflash">
+                  <label class="form-check-label" for="tmn-online-watch-tabflash">Tab title flash</label>
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-online-watch-sound">
+                  <label class="form-check-label" for="tmn-online-watch-sound">Sound alert</label>
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-online-watch-telegram">
+                  <label class="form-check-label" for="tmn-online-watch-telegram">Telegram watch alert</label>
+                </div>
+                <div id="tmn-online-watch-status" class="small text-muted mb-2">Not scanned yet</div>
+                <button id="tmn-open-online-watch" class="btn btn-sm btn-outline-info">Edit Watch List</button>
+                <button id="tmn-online-watch-scan-now" class="btn btn-sm btn-outline-success ms-1">Scan Now</button>
+              </div>
+
+              <hr style="border-color:#1f2937">
               <h6 style="color:#cbd5e1;">Telegram Notifications</h6>
               <div class="mb-3">
                 <div class="form-check form-switch mb-2">
@@ -5546,8 +6544,16 @@ let logoutNotificationSent = false;
                   <label class="form-check-label" for="tmn-notify-messages">Notify on New Messages</label>
                 </div>
                 <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-notify-script-test">
+                  <label class="form-check-label" for="tmn-notify-script-test">Alert 5x on inbox title "Script test"</label>
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-notify-staff-mail">
+                  <label class="form-check-label" for="tmn-notify-staff-mail">Alert 5x on SQL/Stipe inbox messages</label>
+                </div>
+                <div class="form-check mb-2">
                   <input class="form-check-input" type="checkbox" id="tmn-notify-sql">
-                  <label class="form-check-label" for="tmn-notify-sql">Notify on SQL Script Check</label>
+                  <label class="form-check-label" for="tmn-notify-sql">Notify on SQL/Stipe Script Check page</label>
                 </div>
                 <div class="form-check mb-2">
                   <input class="form-check-input" type="checkbox" id="tmn-notify-logout">
@@ -5654,6 +6660,30 @@ let logoutNotificationSent = false;
               <div id="tmn-whitelist-entries"></div>
               <button id="tmn-whitelist-add" class="btn btn-sm btn-outline-success mt-2" style="width:100%;">+ Add Player</button>
               <button id="tmn-clear-cooldowns" class="btn btn-sm btn-outline-warning mt-2" style="width:100%;">Clear OC/DTM Cooldowns</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tmn-online-watch-modal" class="modal" role="dialog" aria-hidden="true">
+        <div class="modal-dialog">
+          <div class="modal-content" style="width: 340px;">
+            <div class="modal-header" style="padding: 8px 12px;">
+              <h6 class="modal-title" style="margin:0;">🟢 Online Watch Alerts</h6>
+              <button id="tmn-online-watch-close" type="button" class="btn btn-sm btn-outline-secondary" title="Close"><i class="bi bi-x"></i></button>
+            </div>
+            <div class="modal-body" style="padding: 10px 12px;">
+              <small class="text-muted d-block mb-2">Add up to 10 player names. Alerts fire when a watched name changes to online, or again after the cooldown.</small>
+              <div id="tmn-online-watch-list"></div>
+              <div class="d-flex gap-2 mt-2">
+                <input type="text" id="tmn-online-watch-new-name" class="form-control form-control-sm" maxlength="40" placeholder="Player name">
+                <button id="tmn-online-watch-add" class="btn btn-sm btn-outline-success" style="white-space:nowrap;">+ Add</button>
+              </div>
+              <div class="d-flex gap-2 mt-2">
+                <button id="tmn-online-watch-modal-scan" class="btn btn-sm btn-outline-info" style="flex:1;">Scan Now</button>
+                <button id="tmn-online-watch-clear" class="btn btn-sm btn-outline-warning" style="flex:1;">Clear Status</button>
+              </div>
+              <small class="text-muted d-block mt-2">Uses the existing Telegram settings above when Telegram watch alert is enabled.</small>
             </div>
           </div>
         </div>
@@ -6138,6 +7168,154 @@ let logoutNotificationSent = false;
       }
     }
 
+
+    // Online Watch toggle, settings, and modal
+    const onlineWatchMainToggle = shadowRoot.querySelector("#tmn-online-watch-enabled");
+    const onlineWatchModalToggle = shadowRoot.querySelector("#tmn-online-watch-modal-enabled");
+
+    function setOnlineWatchEnabled(enabled) {
+      onlineWatchConfig.enabled = Boolean(enabled);
+      saveOnlineWatchConfig();
+      startOnlineWatchScheduler();
+      if (onlineWatchMainToggle) onlineWatchMainToggle.checked = onlineWatchConfig.enabled;
+      if (onlineWatchModalToggle) onlineWatchModalToggle.checked = onlineWatchConfig.enabled;
+      updateStatus('Online Watch Alerts ' + (onlineWatchConfig.enabled ? 'Enabled' : 'Disabled'));
+      if (onlineWatchConfig.enabled && onlineWatchConfig.browserNotify && 'Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+    }
+
+    if (onlineWatchMainToggle) {
+      onlineWatchMainToggle.checked = onlineWatchConfig.enabled;
+      onlineWatchMainToggle.addEventListener('change', e => setOnlineWatchEnabled(e.target.checked));
+    }
+
+    if (onlineWatchModalToggle) {
+      onlineWatchModalToggle.checked = onlineWatchConfig.enabled;
+      onlineWatchModalToggle.addEventListener('change', e => setOnlineWatchEnabled(e.target.checked));
+    }
+
+    const onlineWatchLabel = shadowRoot.querySelector("#tmn-online-watch-label");
+    const onlineWatchModal = shadowRoot.querySelector('#tmn-online-watch-modal');
+    const onlineWatchBackdrop = shadowRoot.querySelector('#tmn-modal-backdrop');
+
+    function showOnlineWatchModal() {
+      if (!onlineWatchModal || !onlineWatchBackdrop) return;
+      onlineWatchModal.classList.add('show');
+      onlineWatchModal.setAttribute('aria-hidden', 'false');
+      onlineWatchBackdrop.style.display = 'block';
+      renderOnlineWatchUI();
+    }
+
+    function hideOnlineWatchModal() {
+      if (!onlineWatchModal || !onlineWatchBackdrop) return;
+      onlineWatchModal.classList.remove('show');
+      onlineWatchModal.setAttribute('aria-hidden', 'true');
+      onlineWatchBackdrop.style.display = 'none';
+      saveOnlineWatchConfig();
+    }
+
+    if (onlineWatchLabel) {
+      onlineWatchLabel.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showOnlineWatchModal();
+      });
+    }
+
+    const openOnlineWatchBtn = shadowRoot.querySelector('#tmn-open-online-watch');
+    if (openOnlineWatchBtn) openOnlineWatchBtn.addEventListener('click', showOnlineWatchModal);
+
+    const closeOnlineWatchBtn = shadowRoot.querySelector('#tmn-online-watch-close');
+    if (closeOnlineWatchBtn) closeOnlineWatchBtn.addEventListener('click', hideOnlineWatchModal);
+
+    const addOnlineWatchBtn = shadowRoot.querySelector('#tmn-online-watch-add');
+    const newOnlineWatchName = shadowRoot.querySelector('#tmn-online-watch-new-name');
+    if (addOnlineWatchBtn && newOnlineWatchName) {
+      const addFromInput = () => {
+        addOnlineWatchPlayer(newOnlineWatchName.value);
+        newOnlineWatchName.value = '';
+        newOnlineWatchName.focus();
+      };
+      addOnlineWatchBtn.addEventListener('click', addFromInput);
+      newOnlineWatchName.addEventListener('keydown', e => {
+        if (e.key === 'Enter') addFromInput();
+      });
+    }
+
+    const onlineWatchSeconds = shadowRoot.querySelector('#tmn-online-watch-seconds');
+    if (onlineWatchSeconds) {
+      onlineWatchSeconds.value = onlineWatchConfig.scanSeconds;
+      onlineWatchSeconds.addEventListener('change', e => {
+        onlineWatchConfig.scanSeconds = Math.max(ONLINE_WATCH_MIN_SCAN_SECONDS, Math.min(3600, Number(e.target.value || ONLINE_WATCH_DEFAULT_SCAN_SECONDS)));
+        e.target.value = onlineWatchConfig.scanSeconds;
+        saveOnlineWatchConfig();
+        startOnlineWatchScheduler();
+        updateStatus(`Online watch interval: ${onlineWatchConfig.scanSeconds}s`);
+      });
+    }
+
+    const onlineWatchBrowser = shadowRoot.querySelector('#tmn-online-watch-browser');
+    if (onlineWatchBrowser) {
+      onlineWatchBrowser.checked = onlineWatchConfig.browserNotify;
+      onlineWatchBrowser.addEventListener('change', e => {
+        onlineWatchConfig.browserNotify = e.target.checked;
+        saveOnlineWatchConfig();
+        if (onlineWatchConfig.browserNotify) {
+          requestBrowserNotificationPermission().catch(() => {});
+        }
+      });
+    }
+
+    const onlineWatchTabFlash = shadowRoot.querySelector('#tmn-online-watch-tabflash');
+    if (onlineWatchTabFlash) {
+      onlineWatchTabFlash.checked = onlineWatchConfig.tabFlash;
+      onlineWatchTabFlash.addEventListener('change', e => {
+        onlineWatchConfig.tabFlash = e.target.checked;
+        saveOnlineWatchConfig();
+      });
+    }
+
+    const onlineWatchSound = shadowRoot.querySelector('#tmn-online-watch-sound');
+    if (onlineWatchSound) {
+      onlineWatchSound.checked = onlineWatchConfig.soundAlert;
+      onlineWatchSound.addEventListener('change', e => {
+        onlineWatchConfig.soundAlert = e.target.checked;
+        saveOnlineWatchConfig();
+      });
+    }
+
+    const onlineWatchTelegram = shadowRoot.querySelector('#tmn-online-watch-telegram');
+    if (onlineWatchTelegram) {
+      onlineWatchTelegram.checked = onlineWatchConfig.telegramNotify;
+      onlineWatchTelegram.addEventListener('change', e => {
+        onlineWatchConfig.telegramNotify = e.target.checked;
+        saveOnlineWatchConfig();
+      });
+    }
+
+    const onlineWatchScanNow = shadowRoot.querySelector('#tmn-online-watch-scan-now');
+    if (onlineWatchScanNow) onlineWatchScanNow.addEventListener('click', () => runOnlineWatchScan('manual'));
+
+    const onlineWatchModalScan = shadowRoot.querySelector('#tmn-online-watch-modal-scan');
+    if (onlineWatchModalScan) onlineWatchModalScan.addEventListener('click', () => runOnlineWatchScan('manual'));
+
+    const onlineWatchClear = shadowRoot.querySelector('#tmn-online-watch-clear');
+    if (onlineWatchClear) {
+      onlineWatchClear.addEventListener('click', () => {
+        onlineWatchConfig.lastOnline = {};
+        onlineWatchConfig.lastAlert = {};
+        onlineWatchConfig.lastScanAt = 0;
+        onlineWatchConfig.lastScanOk = false;
+        onlineWatchConfig.lastScanMessage = 'Status cleared';
+        saveOnlineWatchConfig();
+        renderOnlineWatchUI();
+        updateStatus('Online watch status cleared');
+      });
+    }
+
+    renderOnlineWatchUI();
+
     // ALL ON/OFF toggle functionality
     shadowRoot.querySelector("#tmn-auto-all").addEventListener('change', e => {
       const allEnabled = e.target.checked;
@@ -6388,6 +7566,8 @@ let logoutNotificationSent = false;
     shadowRoot.querySelector("#tmn-telegram-chat").value = telegramConfig.chatId;
     shadowRoot.querySelector("#tmn-notify-captcha").checked = telegramConfig.notifyCaptcha;
     shadowRoot.querySelector("#tmn-notify-messages").checked = telegramConfig.notifyMessages;
+    shadowRoot.querySelector("#tmn-notify-script-test").checked = telegramConfig.notifyInboxScriptTest;
+    shadowRoot.querySelector("#tmn-notify-staff-mail").checked = telegramConfig.notifyStaffMailCheck;
 
     shadowRoot.querySelector("#tmn-telegram-enabled").addEventListener('change', e => {
       telegramConfig.enabled = e.target.checked;
@@ -6414,6 +7594,17 @@ let logoutNotificationSent = false;
       telegramConfig.notifyMessages = e.target.checked;
       saveTelegramConfig();
     });
+
+    shadowRoot.querySelector("#tmn-notify-script-test").addEventListener('change', e => {
+      telegramConfig.notifyInboxScriptTest = e.target.checked;
+      saveTelegramConfig();
+    });
+
+    shadowRoot.querySelector("#tmn-notify-staff-mail").addEventListener('change', e => {
+      telegramConfig.notifyStaffMailCheck = e.target.checked;
+      saveTelegramConfig();
+    });
+
     shadowRoot.querySelector("#tmn-notify-sql").checked = telegramConfig.notifySqlCheck;
 
     shadowRoot.querySelector("#tmn-notify-sql").addEventListener('change', e => {
@@ -6482,18 +7673,26 @@ let logoutNotificationSent = false;
       logoutAlertConfig.browserNotify = e.target.checked;
       saveLogoutAlertConfig();
       // Request notification permission when enabled
-      if (logoutAlertConfig.browserNotify && Notification.permission === 'default') {
-        Notification.requestPermission().then(perm => {
+      if (logoutAlertConfig.browserNotify) {
+        requestBrowserNotificationPermission().then(perm => {
           updateStatus('Browser notifications: ' + perm);
         });
       } else {
-        updateStatus('Browser notify ' + (logoutAlertConfig.browserNotify ? 'enabled' : 'disabled'));
+        updateStatus('Browser notify disabled');
       }
     });
 
     shadowRoot.querySelector("#tmn-test-logout-alert").addEventListener('click', () => {
       updateStatus('Testing logout alerts...');
       triggerLogoutAlerts();
+      if (telegramConfig.enabled && telegramConfig.notifyLogout) {
+        sendTelegramMessage(
+          '🚪 <b>LOGOUT/TIMEOUT TEST ALERT</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Time: ${formatDateUK()}\n\n` +
+          'This is a manual test of the Logout/Timeout Telegram alert option.'
+        );
+      }
       // Stop tab flash after 5 seconds for the test
       setTimeout(() => {
         stopFlashTabTitle();
@@ -6624,6 +7823,8 @@ let logoutNotificationSent = false;
       if (wlModal) { wlModal.classList.remove('show'); wlModal.setAttribute('aria-hidden', 'true'); }
       const ocLeaderModal = shadowRoot.querySelector('#tmn-oc-leader-modal');
       if (ocLeaderModal) { ocLeaderModal.classList.remove('show'); ocLeaderModal.setAttribute('aria-hidden', 'true'); }
+      const onlineWatchModal2 = shadowRoot.querySelector('#tmn-online-watch-modal');
+      if (onlineWatchModal2) { onlineWatchModal2.classList.remove('show'); onlineWatchModal2.setAttribute('aria-hidden', 'true'); }
       backdrop.style.display = 'none';
       saveState();
       updatePlayerBadge();
@@ -6810,15 +8011,19 @@ async function mainLoop() {
           '✅ Navigating to DTM page...'
         );
         state.isPerformingAction = true;
+        state.currentAction = 'dtm-invite';
+        GM_setValue('actionStartTime', Date.now());
         saveState();
         updateStatus("🚚 Accepting DTM invite...");
         // Use URL path+search to avoid origin mismatch (www vs non-www)
-        try {
-          const dtmUrl = new URL(pendingDTMUrl);
-          window.location.href = dtmUrl.pathname + dtmUrl.search;
-        } catch {
-          window.location.href = pendingDTMUrl.replace(/^https?:\/\/[^/]+/, '');
-        }
+        scheduleOCDTMAction('Navigating to DTM invite', () => {
+          try {
+            const dtmUrl = new URL(pendingDTMUrl);
+            window.location.href = dtmUrl.pathname + dtmUrl.search;
+          } catch {
+            window.location.href = pendingDTMUrl.replace(/^https?:\/\/[^/]+/, '');
+          }
+        });
         return;
       }
 
@@ -6846,15 +8051,19 @@ async function mainLoop() {
             '✅ Navigating to OC page...'
           );
           state.isPerformingAction = true;
+          state.currentAction = 'oc-invite';
+          GM_setValue('actionStartTime', Date.now());
           saveState();
           updateStatus("🕵️ Accepting OC invite...");
           // Use URL path+search to avoid origin mismatch (www vs non-www)
-          try {
-            const ocUrl = new URL(pendingOCUrl);
-            window.location.href = ocUrl.pathname + ocUrl.search;
-          } catch {
-            window.location.href = pendingOCUrl.replace(/^https?:\/\/[^/]+/, '');
-          }
+          scheduleOCDTMAction('Navigating to OC invite', () => {
+            try {
+              const ocUrl = new URL(pendingOCUrl);
+              window.location.href = ocUrl.pathname + ocUrl.search;
+            } catch {
+              window.location.href = pendingOCUrl.replace(/^https?:\/\/[^/]+/, '');
+            }
+          });
           return;
         }
       }
@@ -6862,7 +8071,7 @@ async function mainLoop() {
 
     // ===== PRIORITY 3: Check mail for new invites =====
     // Runs every 60s normally, or IMMEDIATELY when on the mailbox page
-    if ((state.autoOC || state.autoDTM || (telegramConfig.enabled && telegramConfig.notifyMessages))
+    if ((state.autoOC || state.autoDTM || (telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck)))
         && tabManager.isMasterTab) {
       const lastMailCheck = parseInt(localStorage.getItem('tmnLastMailCheckTs') || '0', 10);
       const mailCheckNow = Date.now();
@@ -7067,6 +8276,9 @@ async function mainLoop() {
     // Start DTM/OC timer updates
     startTimerUpdates();
 
+    // Start integrated online player watch alerts (single-master-tab guarded)
+    startOnlineWatchScheduler();
+
     // Initialize hot city detection (scrapes stats page if we're on it)
     try { initHotCity(); } catch (e) { console.warn('[TMN][HotCity] init error:', e); }
 
@@ -7075,7 +8287,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.10 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.20 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
@@ -7087,6 +8299,11 @@ async function mainLoop() {
     window.addEventListener('beforeunload', () => {
       tabManager.releaseMaster();
       stopUnifiedMailWatcher();
+      stopOnlineWatchScheduler();
+      if (onlineWatchTitleFlashTimer) {
+        clearInterval(onlineWatchTitleFlashTimer);
+        onlineWatchTitleFlashTimer = null;
+      }
     });
 
     // Cross-tab synchronization for running state
