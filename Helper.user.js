@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.20
+// @name         TMN TDS Auto v17.46
 // @namespace    http://tampermonkey.net/
-// @version      17.20
-// @description  v17.20 — fixes Telegram logout/timeout alerts on login.aspx?act=out and keeps v17.13 crusher flow
+// @version      17.46
+// @description  v17.46 — Auto-login fix: don't require a captcha token when no captcha is rendered on the login page
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -10,6 +10,8 @@
 // @match        *://www.tmn2010.net/Authenticated/*
 // @match        *://www.tmn2010.net/Default.aspx*
 // @match        *://www.tmn2010.net/default.aspx*
+// @match        *://www.tmn2010.net/Authenticated/Default.aspx*
+// @match        *https://www.tmn2010.net/authenticated/
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
@@ -20,16 +22,557 @@
 // ==/UserScript==
 
 /*
-TMN TDS Auto v17.20 CHANGELOG
-- Added request timeouts to background GET requests used by mailbox/invite checks so a hanging request cannot stall the main loop.
-- Added Telegram POST timeouts and stored last Telegram send status/error for easier troubleshooting.
-- Fixed main-loop mail gate so Script Test and SQL/Stipe Staff Mail alerts still scan when general Notify Messages is disabled.
-- Added an in-flight lock around unifiedMailCheck() to prevent overlapping mailbox scans.
-- Added an authenticated captcha submit guard to avoid repeated submit-click scheduling while the same captcha token remains present.
-- Added missing actionStartTime writes for OC/DTM/health/pending-invite action states so stuck-action recovery has a valid timestamp.
-- Escaped dynamic Telegram HTML fields in staff/page and normal mail alerts to avoid malformed Telegram messages.
-- Kept the v17.13-style one-car crusher flow and the v17.19 logout/timeout Telegram fix.
-- Reliability/load cleanup only: no changes intended to bypass site detection or restrictions.
+TMN TDS Auto v17.46 — changelog
+
+FIX IN v17.46:
+- Auto-login stopped auto-submitting after logout: attemptLogin() and
+  checkLoginPage() both unconditionally required a non-empty reCAPTCHA
+  token before proceeding. When TMN doesn't render a captcha element on
+  the login page (getCaptchaToken() finds nothing, returns ""), that
+  requirement could never be satisfied, so the auto-submit gate never
+  opened - credentials got filled but the button was never clicked, no
+  error, no retry, just silently stuck on "Solve captcha to continue..."
+  forever. isCaptchaCompleted() already had a no-captcha fallback path
+  (button enabled + fields filled = completed) but the token requirement
+  downstream of it didn't share that logic. Both functions now check
+  whether a captcha element actually exists on the page
+  (document.querySelector(TOKEN_SEL)) and only require/compare a token
+  when one does; if no captcha is present, a filled+enabled form is
+  enough to submit.
+
+--- v17.45 changelog below ---
+
+TMN TDS Auto v17.45 — changelog
+
+NEW IN v17.45:
+- Hot City safety net for Auto Travel. Independent of the four existing
+  DTM-completion triggers (Complete DTM button, buy-max-drugs, buy-
+  prefilled-drugs, DTM completion mail): every
+  config.hotCitySafetyCheckInterval (default 30 min, configurable in
+  Settings under the new "Auto Travel safety net" option), re-verifies
+  you're actually sitting in the hot city and travels back immediately
+  (private jet) if not - a backstop for any case where none of the four
+  triggers fired (e.g. traveled away manually, or a trigger was missed for
+  some other reason).
+  Implementation deliberately reuses the exact same pendingTravelBack /
+  travelBackQueuedAt / doTravelBackToHotCity machinery as the DTM triggers,
+  rather than duplicating the hot-city-comparison or travel-click logic:
+  checkHotCitySafetyNet() only ever sets travelBackQueuedAt to a value
+  that's already past the existing 22-minute wait, so mainLoop's existing
+  gate is satisfied on the very next tick and goes straight to
+  navigate-and-check - "immediately" in practice. If you're already in the
+  hot city, doTravelBackToHotCity() clears pendingTravelBack right back off
+  silently, no travel attempted, no wasted jet cooldown. Won't stomp an
+  already-queued/in-progress DTM-triggered travel-back - just waits its
+  turn if one's already in flight.
+  TRAVEL_BACK_DELAY_MS was hoisted from a mainLoop-local const to module
+  scope so both the DTM-trigger gate and this new function share the same
+  value instead of risking drift between two copies.
+
+--- v17.44 changelog below ---
+
+TMN TDS Auto v17.44 — changelog
+
+CHANGE IN v17.44:
+- Auto Extend Bunker: threshold changed from 24 hours to 48 hours or less
+  remaining before the 14-day extension purchase gets queued
+  (BUNKER_EXT_THRESHOLD_MS, both the page-label and mail-timestamp detection
+  paths use the same constant). Just gives more lead time to actually reach
+  the Credits page and complete the purchase before expiry. Settings-page
+  tooltip updated to match ("48 hours or less"). No other behavior changed -
+  same 75-credit cost, same independence from the deposit toggle, same
+  detection paths.
+
+--- v17.43 changelog below ---
+
+TMN TDS Auto v17.43 — changelog
+
+NEW IN v17.43:
+- New Telegram alert: Bank Withdrawal. TMN shows a confirmation label after
+  a bank withdrawal - "Money from your bank account has been given back to
+  you with 5% interest, a total of $36,750,000" - rendered into the same
+  generic #ctl00_lblMsg/.TMNErrorFont label the script already reads
+  elsewhere for page messages (it's TMN's general message slot, not
+  actually always an error). checkForBankWithdrawal() looks for that label
+  on every mainLoop tick (same cadence as the existing captcha/low-health/
+  logout checks - no extra timer, no page-specific gating needed since the
+  label only appears on the page that shows it), pulls out the interest %
+  and dollar amount with a regex, and sends a Telegram message once per
+  distinct message text. Dedup is via a localStorage-cached copy of the
+  last-notified label text (survives reloads/navigation) rather than a
+  fixed cooldown, since the dollar amount is different every time and
+  there's no natural id to key off - comparing full text is exact and
+  cheap. New toggle telegramConfig.notifyBankWithdrawal (default on,
+  persisted via GM_setValue like the other notify* flags) plus a matching
+  checkbox in the Telegram settings panel.
+
+--- v17.42 changelog below ---
+
+TMN TDS Auto v17.42 — changelog
+
+NEW IN v17.42:
+- Auto Extend Bunker now has a second, independent way to notice the bunker
+  is about to blow up, triggered from ordinary mailbox activity instead of
+  only a playerproperty.aspx page visit. First attempt (mid-development)
+  tried matching mail BODY content for the "bunker will blow up" sentence,
+  but the actual confirmed mail turned out to have no bunker-related text
+  at all - subject "hello", sender "Scream" - so there's nothing to filter
+  or match on in the mail itself.
+  Final approach: state.bunkerExpiresAt caches the expiry timestamp the
+  moment it's read off the page label (doBunkerSubmit already visits that
+  page on the usual interval) - now cached unconditionally, not just when
+  already due. Then, during the existing unifiedMailCheck() inbox scan,
+  each mail row's OWN timestamp (via the existing parseTMNDateFromText
+  helper, same one the DTM/OC dedup layers already use - no mail-opening
+  needed) is compared against that cached expiry. If any mail's timestamp
+  lands within 24h of the cached expiry, state.bunkerExtendPending is set
+  directly - the same flag checkAndExtendBunker() already consumes, so the
+  Credits-page navigation and Buy click downstream are unchanged.
+  Needs the bunker page to have been visited at least once first (to know
+  bunkerExpiresAt), but after that, ordinary mail traffic alone is enough
+  to notice the 24h window - no further page visit needed. bunkerExpiresAt
+  is cleared back to 0 whenever a purchase succeeds or the toggle is
+  switched off, so a stale cached expiry can never re-trigger by mistake.
+- Fixed a second bug in the same area, same root cause as v17.38: the outer
+  mainLoop gate at "PRIORITY 3: Check mail for new invites" (which decides
+  whether unifiedMailCheck() runs AT ALL) only checked autoOC/autoDTM/
+  autoTravelAfterDTM/Telegram - state.autoBunkerExtend was missing, even
+  though unifiedMailCheck()'s own internal gate already included it. So for
+  a setup with ONLY Auto Extend Bunker on (no OC/DTM/Travel, no relevant
+  Telegram alerts), the mailbox was never scanned at all - the mail-based
+  trigger above would have been silently dead code without this fix,
+  exactly like the Auto-Travel-only leader case v17.38 fixed for the DTM
+  completion mail. Both gates now agree.
+- Fixed a timezone bug in parseBunkerExpireDate(): it built the timestamp
+  with `new Date(year, month-1, day, ...)`, which interprets the numbers
+  in the BROWSER's local timezone. parseTMNDateFromText (used for mail row
+  timestamps) already notes TMN server times are UTC and uses Date.UTC()
+  for exactly that reason. Comparing a UTC-based mail timestamp against a
+  locally-interpreted expiry silently skewed the "hours left" math by the
+  browser's UTC offset (e.g. UK BST = UTC+1 in summer). Switched to
+  Date.UTC() so both sides of every comparison are apples-to-apples.
+- The existing page-label check in doBunkerSubmit() (v17.31/v17.36/v17.40)
+  is unchanged in structure and still runs as before - this is purely
+  additive. Either path (page visit or mail) can set bunkerExtendPending;
+  checkAndExtendBunker() doesn't care which one did it.
+
+--- v17.40 changelog below ---
+
+TMN TDS Auto v17.40 — changelog
+
+FIX IN v17.40:
+- Auto Extend Bunker never triggered a navigation to the Credits page, even
+  with well under 24h left on the bunker. Root cause: parseBunkerExpireDate()
+  matched the expiry label's text against an ANCHORED regex (^...$), which
+  requires the entire trimmed label to be nothing but the date/time. The
+  real label on playerproperty.aspx is a full sentence with the date
+  embedded partway through - "Your bunker will blow up on 5-8-2026
+  00:03:09 unless you extend it from the Credits page before that." -
+  confirmed from an actual live label. Against a full sentence like that
+  the anchored regex never matched, so parseBunkerExpireDate() always
+  returned null, bunkerExtendPending was never set to true, and nothing
+  downstream (the Credits-page navigation, the Buy click) ever had a
+  reason to run. This failed completely silently - the only trace was a
+  console.log('Could not parse expiry date text: ...'), nothing visible
+  in the on-screen status.
+  Fix: dropped the ^ / $ anchors so the same D-M-YYYY HH:MM:SS pattern is
+  now pulled out of wherever it sits in the sentence, instead of requiring
+  an exact full-string match. Everything downstream (BUNKER_EXT_THRESHOLD_MS
+  gate, credits check, Credits-page navigation, Buy click,
+  scheduleMailDeletion-style bookkeeping) was already working correctly and
+  is unchanged.
+
+--- v17.39 changelog below ---
+
+TMN TDS Auto v17.39 — changelog
+
+NEW IN v17.39:
+- DTM completion mail is now auto-deleted 40 minutes after it's confirmed,
+  reusing the same generic mail-deletion queue already built for accepted
+  OC/DTM invite mails (scheduleMailDeletion/checkAndProcessMailDeletions -
+  localStorage-backed {mailId: dueTs} map, ticks the row and clicks Delete
+  on the next mailbox visit once due). This runs unconditionally once the
+  completion mail is confirmed - it does NOT require
+  state.autoTravelAfterDTM to be on, only that the mailbox scan itself is
+  running (i.e. at least one of Auto DTM/Auto OC/Auto Travel/the relevant
+  Telegram alerts is enabled - if none of those are on, nothing scans mail
+  at all, so there's nothing to delete either).
+  New constant DTM_COMPLETE_MAIL_DELETE_DELAY_MS (40 min), separate from the
+  5-minute MAIL_DELETE_DELAY_MS used for invite mails.
+  Point of this: the completion mail's row text can loosely re-match the
+  same first-pass filter on a later mailbox scan; leaving it sitting in the
+  inbox indefinitely was unnecessary clutter and a latent risk of confusing
+  a future scan, so it now gets cleaned up like invite mails already were.
+
+--- v17.38 changelog below ---
+
+TMN TDS Auto v17.38 — changelog
+
+FIX IN v17.38:
+- Auto Travel to Hot City after DTM: leaders weren't getting sent back after
+  the 22-minute wait. Root cause was the mainLoop gate at "PRIORITY 3: Check
+  mail for new invites" (guards whether unifiedMailCheck() runs at all) -
+  it only checked state.autoOC, state.autoDTM, or certain Telegram settings.
+  unifiedMailCheck()'s own internal gate already includes
+  state.autoTravelAfterDTM (added in v17.34, and the v17.34 changelog even
+  says the outer gate was widened to match) but that never actually happened
+  in the outer gate's code until now.
+  Why this hit leaders specifically: the "Complete DTM" button auto-click
+  (handleDTMPageAfterAccept) only runs when localStorage's
+  tmnPendingDTMHandle flag is 'true', which is only set after auto-accepting
+  a DTM invite mail - something only the invited partner does, never the
+  leader who creates the DTM. So for a leader, the DTM-completion mail
+  notification (4th trigger, v17.34) is the ONLY path that can queue
+  pendingTravelBack. If that leader runs with just Auto Travel on (no Auto
+  DTM, no Auto OC, no matching Telegram alerts), the outer gate blocked
+  unifiedMailCheck() from running at all, so the completion mail was never
+  scanned and travel-back never queued - even though everything downstream
+  (the 22-min timer, the private jet click) was working fine.
+  Fix: added state.autoTravelAfterDTM to the outer gate alongside autoOC/
+  autoDTM/Telegram, so the mailbox scan (and therefore the DTM-completion-
+  mail trigger) now runs for an Auto-Travel-only leader same as it always
+  has for a partner running Auto DTM.
+
+--- v17.37 changelog below ---
+
+TMN TDS Auto v17.37 — changelog
+
+NEW IN v17.37:
+- UI only: swapped the display order of Auto Booze and Auto Health in the main
+  toggle grid. Auto Health now sits where Auto Booze used to be (right after
+  Auto GTA); Auto Booze moved down to where Auto Health used to be (right
+  after Auto Jail). Same checkboxes, same IDs, same event listeners, same
+  state keys - purely a reorder in the HTML, no behavior change.
+
+--- v17.36 changelog below ---
+
+TMN TDS Auto v17.36 — changelog
+
+NEW IN v17.36:
+- Ported Auto Extend Bunker from the v17.31 branch (that branch was off v17.28
+  and never had Auto Travel/the toggle-grid reorder, so it had drifted apart
+  from this line). Everything else in this file is unchanged from v17.35 -
+  this is purely an addition, not a merge of v17.31's other differences.
+  Confirmed from the actual page markup: the Artillery Bunker panel
+  (playerproperty.aspx) shows an expiry label (ctl00_main_lblArtBunkExpireDate,
+  format "D-M-YYYY HH:MM:SS") saying when the bunker blows up, and the Credits
+  page has a "Buy" button (ctl00_main_btnArtilleryBunkerExt) that spends 75
+  credits for a 14-day extension. New toggle - "Auto Extend Bunker (uses
+  credits)" - lives in the Settings modal under Bunker Options, deliberately
+  NOT in the main toggle grid and NOT wired into "ALL ON" (same treatment as
+  Auto Travel), since it's the kind of thing that should be a conscious opt-in
+  given it spends credits automatically.
+  Behavior: the expiry label is read as a side effect of the existing bunker
+  page visit (same check interval as bullet deposits, no extra navigation
+  needed to notice it's due) and the extension is only ever queued once <=24
+  hours remain - this 24h gate is hard-coded (BUNKER_EXT_THRESHOLD_MS), not
+  configurable. Once queued, it reuses the exact navigate-to-Credits-page +
+  click-and-reload pattern already used by Auto Health (the only other
+  feature spending credits from this page): if credits are short, it just
+  waits and rechecks each tick without navigating anywhere; once there are
+  enough, it navigates to the Credits page and clicks Buy, then confirms via
+  a Telegram message and reload. Works independently of the bullet-deposit
+  toggle (autoBunker) - an extension-only setup with deposits turned off will
+  still visit the bunker page on schedule for the expiry check without ever
+  touching the deposit form.
+
+--- v17.35 changelog below ---
+
+TMN TDS Auto v17.35 — changelog
+
+CHANGE IN v17.35:
+- Main panel UI: the switches grid mixed plain on/off toggles with the 3
+  toggles whose labels are also clickable blue links that open a modal
+  (Create OC, Whitelist, Online Watch Alerts), scattered in the middle of
+  the list. Purely cosmetic reorder - moved all 3 blue-link toggles down
+  to the bottom of the grid (after a thin divider), grouped together, so
+  the "just a switch" rows and the "switch + click label for options"
+  rows are visually separated. No IDs, event listeners, or behavior
+  changed - same elements, same state keys, just reordered in the DOM.
+
+--- v17.34 changelog below ---
+
+TMN TDS Auto v17.34 — changelog
+
+CHANGE IN v17.34:
+- Auto Travel to Hot City after DTM: added the 4th trigger - a DTM
+  completion mail notification - confirmed against a real mail:
+    "<b>Drugs Transportation Mission</b><br /><br />
+     Congratulations, <partner> and you successfully completed a Drugs
+     Transportation Mission in <City> - <Country>. Both participants earned
+     $X from this mission! Additionally, you managed to find and smuggle N
+     <FMJ/JHP> bullets."
+  Detection reuses the existing unifiedMailCheck() mailbox scan (the same
+  background poll that already looks for OC/DTM invite mail): each row gets
+  a cheap first-pass filter on its text ("drugs transportation mission",
+  and not already matched as an invite), then the mail is actually opened
+  via gmGet and its body is checked for the more specific "successfully
+  completed a Drugs Transportation Mission" phrase before it's trusted as a
+  genuine completion signal - the row text alone wasn't confirmed to be
+  specific enough to rule out an invite mail using similar wording. Dedup is
+  by mail ID (tmnLastDTMCompleteMailId), same pattern as the invite watcher.
+  The mail scan's top-level gate was widened so it still runs when only
+  Auto Travel is enabled (previously required autoOC/autoDTM/certain
+  Telegram settings) - otherwise this trigger would never get a chance to
+  see the mailbox at all in an Auto-Travel-only setup.
+  All four triggers now queue the same state.pendingTravelBack /
+  travelBackQueuedAt: Complete DTM button, buy-max-drugs, buy-prefilled-
+  drugs, and this mail notification.
+
+--- v17.33 changelog below ---
+
+TMN TDS Auto v17.33 — changelog
+
+CHANGE IN v17.33:
+- Auto Travel to Hot City after DTM: there were three places in the code
+  that mark a DTM as completed (Complete DTM button, buy-max-drugs, buy-
+  prefilled-drugs), but only the Complete DTM button queued a travel-back.
+  The other two now queue it as well (same state.pendingTravelBack /
+  travelBackQueuedAt, with an explicit saveState() added since those two
+  paths don't otherwise save state before the reload the button click
+  triggers).
+- NOT yet done: a fourth trigger from a DTM-completion mail notification.
+  There's no existing detection for this - startAutoDTMMailWatcher() /
+  stopAutoDTMMailWatcher() are empty stub functions, and the only mail
+  handling that exists today is for DTM *invite* mail (opening it and
+  extracting the accept link), which is a different mail than a completion
+  notice. Building this needs an actual sample of that mail (subject line
+  and/or body text) rather than a guess - see the request for that.
+
+--- v17.32 changelog below ---
+
+TMN TDS Auto v17.32 — changelog
+
+CHANGE IN v17.32:
+- Auto Travel to Hot City after DTM: reworked the trigger and travel mode.
+    - Trigger: was gated on the real travel cooldown via
+      getTravelTimerStatus() (45-min normal-travel cooldown); now waits a
+      fixed 22 minutes from state.travelBackQueuedAt, stamped the moment a
+      DTM completes. Simpler than the cooldown-polling approach it replaces,
+      and matches the ~20-min real cooldown for private jet with a small
+      buffer.
+    - Travel mode: was the "Travel (normal)" button
+      (ctl00_main_btnTravelNormal); now the "Travel (Private jet*)" button
+      (ctl00_main_btnTravelPrivate), confirmed from the live travel.aspx
+      markup.
+  Same hot-city detection, "skip if already there," and 90s stuck-watchdog
+  pause pattern as before - only the timing and the button clicked changed.
+  Toggle label/tooltip updated to match ("waits 22 minutes... private jet").
+  Note: only the "Complete DTM" button click currently queues this
+  travel-back - the two "buy max/prefilled drugs" DTM-completion paths don't
+  set state.pendingTravelBack. That's pre-existing from v17.29 and wasn't
+  part of this change, but worth knowing if travel-back seems to not fire
+  after some DTMs.
+
+--- v17.30 changelog below ---
+
+TMN TDS Auto v17.30 — changelog
+
+UI IN v17.30:
+- Shortened the "🛫 Auto Travel to Hot City after DTM" toggle label to
+  "🛫 Auto Travel" - the full description is still available as a tooltip on
+  hover. The long label was noticeably wider than every other toggle in the
+  2-column grid, throwing off the row it shared with "Auto Jail".
+- Reordered the toggle grid into logically-grouped, length-matched pairs so
+  every row lines up cleanly instead of pairing whatever happened to be
+  declared next to each other:
+    Auto Crime / ALL ON
+    Auto GTA / Auto Booze
+    Auto Health / Auto Jail
+    🚚 Auto DTM / 🛫 Auto Travel   (grouped together - travel-after-DTM)
+    🕵️ Auto OC / 🏢 Create OC
+    Auto Garage / 🔫 Auto Bunker
+    ⚙️ Auto Scrapyard / Auto Crusher
+    🔔 OC/DTM Alerts / Whitelist
+    🟢 Online Watch Alerts (full width, unchanged)
+  No functionality, IDs, or toggle behavior changed - this is layout only.
+
+--- v17.29 changelog below ---
+
+TMN TDS Auto v17.29 — changelog
+
+NEW IN v17.29:
+- Auto Travel to Hot City after DTM. New "🛫 Auto Travel to Hot City after DTM"
+  toggle. When a DTM completes, queues a travel-back (state.pendingTravelBack)
+  instead of using a fixed timer - it waits for the REAL travel cooldown via
+  the existing getTravelTimerStatus() tracker (backed by the background
+  travel-timer poller that already runs every 60s) before doing anything. Once
+  normal travel is actually available, navigates to travel.aspx and travels to
+  whichever city the site itself has marked hot (wrapped in <span class="hot">
+  right on the page), using the "Travel (normal)" button specifically - never
+  the private jet button. Skips cleanly if already in the hot city, or if no
+  hot city is marked on the page. Uses the same "in progress" pause pattern as
+  Bunker/Scrapyard (state.travelBackInProgress, 90s stuck-watchdog) so it
+  doesn't race navigations with them, and deliberately does NOT claim the
+  mainLoop tick while still on cooldown, so crime/GTA/etc keep running
+  normally in the meantime. Reuses scheduleOCDTMAction() for the countdown
+  display and sends a Telegram notification once travel is initiated. Not
+  included in the "Enable All" master toggle since it's a DTM sub-behavior,
+  not a standalone recurring automation.
+
+  Note: the real in-game cooldowns are 45 minutes for normal travel and 20
+  minutes for private jet (confirmed from the travel.aspx page text) - not the
+  22 minutes originally guessed - which is exactly why this checks the live
+  status instead of trusting a fixed number.
+
+--- v17.28 changelog below ---
+
+NEW IN v17.28:
+- Auto Scrapyard. New "⚙️ Auto Scrapyard" toggle + configurable check interval
+  (default 60 min, config.scrapyardCheckInterval). When due, navigates to
+  store.aspx?p=s, reads the current scrap balance (ctl00_main_lblScrapBalance)
+  and, while there's enough scrap for at least one 1000-FMJ buy (5 scrap per
+  the store.aspx?p=s page's own pricing), clicks the Buy link
+  (ctl00_main_lbBuy1kFMJScrap). Mirrors the Artillery Bunker's burst pattern:
+  lastScrapyardCheck is only reset once a check finds scrap too low for
+  another buy, so multiple buys happen back-to-back on successive ticks
+  instead of waiting a full interval between each one, then the loop falls
+  back to the configured interval (hourly by default) once scrap is drained.
+  Uses the same scrapyardCheckInProgress pause pattern as the bunker (and is
+  deliberately only evaluated when the bunker didn't already claim the tick)
+  so at most one "resource top-up" feature is ever navigating/submitting at a
+  time - this is what stops competing navigations from racing each other, per
+  the root-cause fix already made for the bunker in v17.27. Included in the
+  "Enable All" master toggle.
+
+--- v17.27 changelog below ---
+
+TMN TDS Auto v17.27 — changelog
+
+FIX IN v17.27:
+- Artillery Bunker: two problems, one root cause. The bunker interval setting
+  seemed to be ignored and the check usually just didn't run (v17.26 symptom
+  report), and a first attempt at fixing that (making the bunker check fully
+  independent of the crime/GTA/booze/jailbreak priority chain) caused a new
+  problem: the automation would just bounce back and forth between pages with
+  no action ever completing. Root cause of THAT: safeNavigate() doesn't
+  navigate immediately, it schedules the actual page load 1-3s later. The
+  independent bunker check and the crime/GTA priority chain could each
+  schedule a navigation to a *different* page within that window, so two
+  competing navigations ended up racing each other - whichever fired second
+  would yank the page away from the first before it ever finished loading,
+  over and over.
+  Fix: Artillery Bunker now uses a proper pause. The moment a check starts
+  (bunkerCheckInProgress, GM-backed so it survives the page reload mid-check),
+  crime/GTA/booze/jailbreak/garage are skipped entirely for every tick until
+  the check reaches a real end state - submitted with nothing left to
+  deposit, no bullets on hand, no bunker panel, missing form controls, or a
+  blocking page error. A partial deposit (FMJ done, JHP still to go)
+  deliberately leaves the pause on so the next tick finishes the job instead
+  of handing the turn to auto-jailbreak (whose 3s interval was the original
+  culprit) before JHP gets submitted. Only ONE navigation is ever in flight at
+  a time now, which is what stops the back-and-forth. A 90-second watchdog
+  clears the pause automatically if something ever gets stuck, so automation
+  can't freeze permanently. Crime/GTA/booze/jailbreak/garage priority and
+  timing are otherwise unchanged.
+
+--- v17.25 changelog below ---
+
+TMN TDS Auto v17.25 — changelog
+
+FIX IN v17.25:
+- Artillery Bunker: JHP was never actually being deposited, and the bunker check
+  appeared to "stop" after FMJ. Root cause: the bullet-type dropdown
+  (ddlArtBunkBulletType) was selected by a guessed numeric value ('1' for FMJ,
+  '2' for JHP) that was never verified against the real page. Setting
+  select.value to a value that doesn't match any <option> is a silent no-op, so
+  once FMJ was deposited the dropdown just stayed on FMJ - the next cycle then
+  tried to submit the JHP amount while still pointed at FMJ (which now has 0 on
+  hand), which the game almost certainly rejected. That rejection then tripped
+  the script's own blocking-error gate, which shelves the bunker check for a
+  full 15 minutes - so from the outside it looked like the loop "stopped after
+  FMJ" instead of moving on to JHP.
+  Fix: select the dropdown option by matching its visible label text
+  ("fmj"/"jhp") instead of a hardcoded value, and dispatch a change event so
+  the page picks up the selection. Falls back to the old guessed value (with a
+  console warning) only if no option's text matches, so a future mismatch is
+  visible instead of silently failing again.
+
+--- v17.24 changelog below ---
+
+TMN TDS Auto v17.24 — changelog
+
+NEW IN v17.24:
+- Artillery Bunker auto-deposit. New "🔫 Auto Bunker" toggle + configurable check
+  interval (default 15 min, config.bunkerCheckInterval). When due, navigates to
+  playerproperty.aspx (base URL, no p= param - this is where the Money/Credits/Bullets/
+  Artillery Bunker panel lives), reads on-hand FMJ/JHP straight from the header stats
+  bar (ctl00_userInfo_lblfmj / lbljhp - already scraped elsewhere in this script), and
+  deposits whichever is available via the real form controls
+  (ctl00_main_tbArtBunkAddBullets / ddlArtBunkBulletType / btnArtBunkDeposit). The
+  deposit form only takes one bullet type per submit, so if both FMJ and JHP are on
+  hand it deposits FMJ first and drains JHP on the very next tick rather than waiting a
+  full interval - the 15-minute timer only resets once a check finds nothing left to
+  deposit. Reuses the existing scheduleOCDTMAction() countdown helper before clicking
+  Deposit, and sends a Telegram notification on success. Runs at the same "own interval,
+  lowest priority, doesn't block other automation" tier as Garage, and is included in
+  the "Enable All" master toggle.
+
+--- v17.23 changelog below ---
+
+NEW IN v17.23:
+- Restored the v17.20 UI behavior of showing the countdown between OC/DTM invite
+  action clicks on the panel's status line (e.g. "Completing DTM in 14s..."), not just
+  in the console log. Re-added the scheduleOCDTMAction(label, fn) helper (removed in
+  v17.22's refactor) and switched all six OC/DTM invite action sites back to it:
+  clicking the OC Accept link, clicking the OC role/weapon/car selection button, the
+  fallback choose/select button, clicking Complete DTM, buying DTM drugs (max amount),
+  and buying DTM drugs when the amount field was already prefilled. The 3-20s
+  randomized delay itself (DELAYS.ocDtmAction) is unchanged; only the missing UI
+  countdown was added back. As a side fix, the prefilled-drugs buy click was on the
+  1.1-1.9s "quick" delay tier instead of the 3-20s OC/DTM tier - it now uses
+  scheduleOCDTMAction like the other five, matching v17.20.
+
+--- v17.22 changelog below ---
+
+TMN TDS Auto v17.22 — changelog
+
+NEW IN v17.22:
+- OC/DTM action clicks now use a randomized 3-20s delay (DELAYS.ocDtmAction) instead of
+  a fixed 2000ms setTimeout or the 1.1-1.9s "quick" tier. Applies to: clicking the OC
+  Accept link, clicking the OC role/weapon/car selection button (incl. the fallback
+  choose/select button), clicking Complete DTM, and clicking Buy Drugs. Mail-invite
+  detection/queueing itself is unchanged - only the on-page action clicks got the wider
+  delay, since mainLoop's own tick interval already varies before a pending invite is
+  picked up and navigated to.
+- Code review pass: confirmed no duplicate function declarations, no colliding
+  localStorage key constants, and the v17.22 mail-auto-delete feature (Priority 3.5) is
+  correctly gated behind `!state.inJail && !state.isPerformingAction` so it can't
+  interrupt an in-progress OC/DTM action. No other bugs found in this pass; this was a
+  targeted review rather than a full line-by-line audit of the whole file.
+
+--- v17.22 changelog below ---
+
+NEW IN v17.22:
+- Auto-delete accepted OC/DTM invite mails. When an invite's accept URL is stored, the
+  mail ID is queued with a due timestamp 5 minutes out (MAIL_DELETE_DELAY_MS). Once due,
+  mainLoop Priority 3.5 opens the mailbox, ticks that single row and clicks Delete
+  (ctl00_main_btnDelMessage). Queue lives in localStorage so it survives page navigations.
+  One deletion per mailbox visit (delete causes a postback). Entries are dropped if the
+  mail is already gone, or abandoned 30 minutes past due if the controls never appear.
+  Only fires for invites that were actually accepted — whitelist-blocked invites and
+  invites where the accept link couldn't be extracted return before queueing.
+
+--- v17.22 merge changelog below ---
+Base: v17.22 (trusted). Only the items below were taken from v17.22.
+
+Fixes carried over from v17.22:
+- Request timeouts on background GET (gmGet) and Telegram POST so a hung request can't stall the main loop.
+- actionStartTime + currentAction writes in the OC-accept, DTM-accept, health-buy and pending-invite handlers so stuck-action recovery has a valid timestamp.
+- Split the overloaded humanDelay() helper: humanDelay(range) for action timing, sleepMs(ms) for OC-creation millisecond waits (a duplicate humanDelay() previously clobbered the range version).
+- In-flight lock around unifiedMailCheck() to stop overlapping mailbox scans.
+- Authenticated captcha submit guard so the same captcha token isn't submitted repeatedly.
+- Early logout/timeout Telegram alert on login.aspx (incl. act=out / timeout / session), with a timestamp-based de-dupe instead of a sticky boolean.
+
+Features added:
+- Online Watch Alerts: watch up to 10 players and alert (browser notification, tab flash, sound, Telegram) when a watched name appears online.
+- Two staff-mail Telegram alerts: 5x on an inbox "Script test" title, and 5x on SQL/Stipe staff inbox messages. Mail gate widened so these scan even when general "New Messages" alerts are off.
+
+Garage:
+- Damage is now read via a robust row-scanner (getGarageRowInfo) instead of fixed column positions, BUT the crusher still only sends cars with damage > 0 and skips any car whose damage can't be parsed (crushing an undamaged car flags script usage).
+- v17.22's automatic crusher self-re-enable block was deliberately NOT carried over.
+
+No changes intended to bypass site detection or restrictions; reliability/load cleanup only.
 */
 
 
@@ -130,6 +673,7 @@ TMN TDS Auto v17.20 CHANGELOG
   let titleFlashInterval = null;
   const originalTitle = document.title;
 
+  // Small browser-notification permission helpers (used by Online Watch)
   function supportsBrowserNotifications() {
     return typeof window !== 'undefined' && 'Notification' in window;
   }
@@ -145,39 +689,6 @@ TMN TDS Auto v17.20 CHANGELOG
       console.warn('[TMN] Browser notification permission request failed:', e);
       return Promise.resolve('denied');
     }
-  }
-
-  function showBrowserNotification(title, options = {}, onClick) {
-    if (!supportsBrowserNotifications()) {
-      console.warn('[TMN] Browser notifications are not supported in this browser/context');
-      return false;
-    }
-
-    const createNotification = () => {
-      try {
-        const notification = new Notification(title, Object.assign({
-          requireInteraction: true,
-          icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
-        }, options));
-        if (typeof onClick === 'function') {
-          notification.onclick = () => {
-            try { onClick(notification); } catch (e) { console.warn('[TMN] Notification click handler failed:', e); }
-          };
-        }
-        return true;
-      } catch (e) {
-        console.warn('[TMN] Browser notification failed:', e);
-        return false;
-      }
-    };
-
-    if (Notification.permission === 'granted') return createNotification();
-    if (Notification.permission === 'default') {
-      requestBrowserNotificationPermission().then(permission => {
-        if (permission === 'granted') createNotification();
-      });
-    }
-    return false;
   }
 
   function flashTabTitle() {
@@ -198,12 +709,22 @@ TMN TDS Auto v17.20 CHANGELOG
   }
 
   function showLogoutBrowserNotification() {
-    showBrowserNotification('TMN2010 Session Expired', {
-      body: 'Click to switch to tab and log back in'
-    }, (notification) => {
-      window.focus();
-      if (notification && typeof notification.close === 'function') notification.close();
-    });
+    if (Notification.permission === 'granted') {
+      new Notification('TMN2010 Session Expired', {
+        body: 'Click to switch to tab and log back in',
+        requireInteraction: true,
+        icon: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=='
+      });
+    } else if (Notification.permission === 'default') {
+      Notification.requestPermission().then(perm => {
+        if (perm === 'granted') {
+          new Notification('TMN2010 Session Expired', {
+            body: 'Click to switch to tab and log back in',
+            requireInteraction: true
+          });
+        }
+      });
+    }
   }
 
   function triggerLogoutAlerts() {
@@ -215,13 +736,12 @@ TMN TDS Auto v17.20 CHANGELOG
     }
   }
 
-
-  // Telegram logout/timeout alert helper is defined early because the script
-  // exits on login.aspx before the main Telegram config block exists.
-  // v17.20 fix: the previous boolean de-dupe could stay stuck as "sent" and block
-  // future alerts on https://www.tmn2010.net/login.aspx?act=out. This now uses a
-  // short timestamp cooldown and a URL-aware key, so act=out is caught reliably
-  // without spamming Telegram on login page refreshes.
+  // ---------------------------
+  // Early Logout/Timeout Telegram Alert (carried from v17.22)
+  // Runs on login.aspx because the script exits early there, before the main
+  // Telegram block exists. Uses a short timestamp cooldown + URL-aware key so
+  // act=out is caught reliably without spamming on login-page refreshes.
+  // ---------------------------
   const LS_LOGOUT_TELEGRAM_SENT = 'tmnLogoutTelegramSent';
   const LS_LOGOUT_TELEGRAM_LAST_TS = 'tmnLogoutTelegramLastTs';
   const LS_LOGOUT_TELEGRAM_LAST_KEY = 'tmnLogoutTelegramLastKey';
@@ -435,7 +955,7 @@ TMN TDS Auto v17.20 CHANGELOG
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.20\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.46\n${message}`;
     }
 
     function clearTimers() {
@@ -506,8 +1026,13 @@ TMN TDS Auto v17.20 CHANGELOG
     function attemptLogin() {
       // Don't clear timers yet — check if we can actually submit first
       const loginBtn = document.getElementById(LOGIN_BTN_ID);
+      const captchaPresent = Boolean(document.querySelector(TOKEN_SEL));
       const currentToken = getCaptchaToken();
-      if (!loginBtn || loginBtn.disabled || !currentToken) {
+      // Only require a token when there's actually a captcha element on the
+      // page. TMN doesn't always render one (e.g. no-captcha login flow),
+      // and in that case waiting on a token that will never appear stalls
+      // auto-login forever.
+      if (!loginBtn || loginBtn.disabled || (captchaPresent && !currentToken)) {
         // Token may have flickered — retry up to 3 times over 1.5s before giving up
         if (!attemptLogin._retries) attemptLogin._retries = 0;
         attemptLogin._retries++;
@@ -584,17 +1109,22 @@ TMN TDS Auto v17.20 CHANGELOG
       const loginBtn = document.getElementById(LOGIN_BTN_ID);
       const captchaCompleted = isCaptchaCompleted();
       const currentToken = getCaptchaToken();
-      if (loginBtn && !loginBtn.disabled && captchaCompleted && currentToken && currentToken !== lastTokenUsed) {
+      // A captcha element only needs a fresh, unused token when the site
+      // actually renders one. If there's no captcha on the page at all,
+      // don't block forever waiting for a token that will never exist.
+      const captchaPresent = Boolean(document.querySelector(TOKEN_SEL));
+      const tokenReady = !captchaPresent || (currentToken && currentToken !== lastTokenUsed);
+      if (loginBtn && !loginBtn.disabled && captchaCompleted && tokenReady) {
         if (!submitTimer) {
           updateLoginOverlay("✅ Captcha completed - auto-submitting...");
           scheduleAutoSubmit(LOGIN_CONFIG.AUTO_SUBMIT_DELAY + Math.floor(Math.random() * 2000));
         }
       } else {
-        if (submitTimer && (!captchaCompleted || !currentToken || (loginBtn && loginBtn.disabled))) {
+        if (submitTimer && (!captchaCompleted || !tokenReady || (loginBtn && loginBtn.disabled))) {
           clearTimers();
           if (!captchaCompleted) {
             updateLoginOverlay("⏳ Waiting for captcha completion...");
-          } else if (!currentToken) {
+          } else if (!tokenReady) {
             updateLoginOverlay("⏳ Waiting for captcha token...");
           } else {
             updateLoginOverlay("⏳ Waiting for login button...");
@@ -702,6 +1232,16 @@ if (currentPath.includes("/authenticated/")) {
     boozeSellAmount: GM_getValue('boozeSellAmount', 1),
     healthCheckInterval: GM_getValue('healthCheckInterval', 30),
     garageInterval: GM_getValue('garageInterval', 300),
+    // v17.45 - Hot city safety net: how often to independently re-verify
+    // we're actually in the hot city, regardless of whether any of the
+    // four DTM-completion triggers fired.
+    hotCitySafetyCheckInterval: GM_getValue('hotCitySafetyCheckInterval', 1800), // 30 minutes
+    // v17.24 - Artillery Bunker: how often to check for on-hand FMJ/JHP to deposit
+    bunkerCheckInterval: GM_getValue('bunkerCheckInterval', 900), // 15 minutes
+    // v17.28 - Scrapyard: how often to re-check scrap balance for FMJ buys
+    // once the burst-buy loop (see doScrapyardSubmit) has drained it below
+    // the cost of one buy
+    scrapyardCheckInterval: GM_getValue('scrapyardCheckInterval', 3600), // 1 hour
     minHealthThreshold: GM_getValue('minHealthThreshold', 90),
     targetHealth: GM_getValue('targetHealth', 100)
   };
@@ -713,7 +1253,10 @@ if (currentPath.includes("/authenticated/")) {
     quick: [1100, 1900],
     normal: [1200, 3000],
     slow: [2500, 6000],
-    error: [5000, 15000]
+    error: [5000, 15000],
+    // v17.22 - OC/DTM action clicks (accept role, buy drugs, complete DTM)
+    // wait a randomized 3-20s instead of a fixed delay before clicking.
+    ocDtmAction: [3000, 20000]
   };
 
   function randomDelay(range = DELAYS.normal) {
@@ -727,32 +1270,22 @@ if (currentPath.includes("/authenticated/")) {
     return Math.max(0, ms);
   }
 
+  // Range-based human delay (used for action timing).
+  // Note: the millisecond-based waiter for OC creation is now a separate
+  // helper, sleepMs(), so it no longer clobbers this range version.
   function humanDelay(range = DELAYS.normal) {
     return new Promise(resolve => setTimeout(resolve, randomDelay(range)));
   }
 
-  // OC/DTM-specific human-like action delays.
-  // Keeps invite accepts, role selections, DTM buys/completes, and OC creation clicks
-  // between 3 and 20 seconds without changing the normal crime/GTA/booze timings.
-  const OC_DTM_ACTION_DELAY = [3000, 20000];
-
-  function randomOCDTMActionDelay() {
-    return randomDelay(OC_DTM_ACTION_DELAY);
-  }
-
+  // v17.23 - Restored from v17.20: schedule an OC/DTM invite action (accept
+  // link, role selection, DTM complete/buy) after a randomized 3-20s delay,
+  // and show the countdown on the panel status line so it's visible on the UI
+  // while the action is pending (not just logged to console).
   function scheduleOCDTMAction(label, fn) {
-    const delay = randomOCDTMActionDelay();
+    const delay = randomDelay(DELAYS.ocDtmAction);
     console.log(`[TMN][OC/DTM DELAY] ${label} in ${Math.round(delay / 1000)}s`);
     updateStatus(`${label} in ${Math.round(delay / 1000)}s...`);
     setTimeout(fn, delay);
-    return delay;
-  }
-
-  async function waitOCDTMActionDelay(label) {
-    const delay = randomOCDTMActionDelay();
-    console.log(`[TMN][OC/DTM DELAY] ${label} waiting ${Math.round(delay / 1000)}s`);
-    updateStatus(`${label} in ${Math.round(delay / 1000)}s...`);
-    await new Promise(resolve => setTimeout(resolve, delay));
     return delay;
   }
 
@@ -770,7 +1303,8 @@ if (currentPath.includes("/authenticated/")) {
     lastMessageCheck: GM_getValue('lastMessageCheck', 0),
     messageCheckInterval: GM_getValue('messageCheckInterval', 60),
     notifySqlCheck: GM_getValue('notifySqlCheck', true),
-    notifyLogout: GM_getValue('notifyLogout', true)
+    notifyLogout: GM_getValue('notifyLogout', true),
+    notifyBankWithdrawal: GM_getValue('notifyBankWithdrawal', true)
 };
 
   function saveTelegramConfig() {
@@ -785,6 +1319,7 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('messageCheckInterval', telegramConfig.messageCheckInterval);
     GM_setValue('notifySqlCheck', telegramConfig.notifySqlCheck);
     GM_setValue('notifyLogout', telegramConfig.notifyLogout);
+    GM_setValue('notifyBankWithdrawal', telegramConfig.notifyBankWithdrawal);
   }
 
   // ---------------------------
@@ -845,7 +1380,6 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('onlineWatchLastScanMessage', onlineWatchConfig.lastScanMessage);
   }
 
-
   let state = {
     autoCrime: GM_getValue('autoCrime', false),
     autoGTA: GM_getValue('autoGTA', false),
@@ -853,6 +1387,8 @@ if (currentPath.includes("/authenticated/")) {
     autoBooze: GM_getValue('autoBooze', false),
     autoHealth: GM_getValue('autoHealth', false),
     autoGarage: GM_getValue('autoGarage', false),
+    // v17.24 - Artillery Bunker auto-deposit
+    autoBunker: GM_getValue('autoBunker', false),
     autoCrusher: GM_getValue('autoCrusher', true),
     // crusherOwned: null = unknown (try it), true = owns crusher, false = doesn't own crusher
     crusherOwned: GM_getValue('crusherOwned', null),
@@ -862,7 +1398,50 @@ if (currentPath.includes("/authenticated/")) {
     lastBooze: GM_getValue('lastBooze', 0),
     lastHealth: GM_getValue('lastHealth', 0),
     lastGarage: GM_getValue('lastGarage', 0),
-    selectedCrimes: GM_getValue('selectedCrimes', [1,3,5]),
+    lastBunkerCheck: GM_getValue('lastBunkerCheck', 0),
+    // v17.27 - true while a bunker check (navigate + submit) is actively in
+    // progress; other actions are paused until this clears back to false.
+    bunkerCheckInProgress: GM_getValue('bunkerCheckInProgress', false),
+    // v17.31 - Auto Extend Bunker (credits): separate opt-in from bullet
+    // deposits since this spends 75 credits. bunkerExtendPending is set once
+    // a bunker-page visit finds <=48h left on the expiry label, and stays
+    // set (driving navigation to the Credits page + the buy click) until
+    // the purchase actually succeeds - mirrors the existing buyingHealth
+    // pattern, the only other feature that already spends credits from this
+    // same Credits page.
+    autoBunkerExtend: GM_getValue('autoBunkerExtend', false),
+    bunkerExtendPending: GM_getValue('bunkerExtendPending', false),
+    // v17.42 - cached bunker expiry timestamp (ms), last read off the
+    // playerproperty.aspx label. Kept around so the mail-scan trigger
+    // (unifiedMailCheck) can compare a fresh mail's own timestamp against
+    // it WITHOUT needing another bunker-page visit or opening any mail
+    // body - see the v17.42 changelog for why this replaced the earlier
+    // open-every-mail-body approach.
+    bunkerExpiresAt: GM_getValue('bunkerExpiresAt', 0),
+    // v17.28 - Scrapyard auto-buy FMJ (uses spare scrap from the crusher)
+    autoScrapyard: GM_getValue('autoScrapyard', false),
+    lastScrapyardCheck: GM_getValue('lastScrapyardCheck', 0),
+    // true while a scrapyard check (navigate + buy) is actively in progress;
+    // same pause pattern as the bunker so navigations never race each other.
+    scrapyardCheckInProgress: GM_getValue('scrapyardCheckInProgress', false),
+    // v17.29 - travel back to the current hot city (normal travel) after a DTM
+    // completes. pendingTravelBack is set true on DTM completion and only
+    // cleared once a genuine end state is reached (traveled, already there,
+    // no hot city found, or missing controls) - it is NOT time-based; it
+    // waits on the real travel cooldown via getTravelTimerStatus().
+    autoTravelAfterDTM: GM_getValue('autoTravelAfterDTM', false),
+    pendingTravelBack: GM_getValue('pendingTravelBack', false),
+    // v17.32 - timestamp (ms) of when the DTM completed that queued this
+    // travel-back. Replaces the old real-cooldown check (getTravelTimerStatus)
+    // with a fixed 22-minute wait, since travel now uses the private jet
+    // (20-min real cooldown) rather than normal travel (45-min).
+    travelBackQueuedAt: GM_getValue('travelBackQueuedAt', 0),
+    // v17.45 - Hot city safety net: independent periodic re-check (see
+    // checkHotCitySafetyNet), separate from the four DTM-completion
+    // triggers above.
+    lastHotCitySafetyCheck: GM_getValue('lastHotCitySafetyCheck', 0),
+    travelBackInProgress: GM_getValue('travelBackInProgress', false),
+    selectedCrimes: GM_getValue('selectedCrimes', [1]),
     selectedGTAs: GM_getValue('selectedGTAs', [5]),
     playerName: GM_getValue('playerName', ''),
     inJail: GM_getValue('inJail', false),
@@ -895,27 +1474,6 @@ if (currentPath.includes("/authenticated/")) {
     ocRepeatsLeft: GM_getValue('ocRepeatsLeft', 0)
   };
 
-  // v17.20 recovery: v17.17 could persistently disable Auto Crusher if the
-  // Send to Crusher button looked disabled after selection. Reset that one-time
-  // stored state so the restored v17.13 crusher flow can run again.
-  try {
-    const crusherResetKey = 'tmnV1718CrusherResetApplied';
-    if (GM_getValue(crusherResetKey, false) !== true) {
-      if (GM_getValue('crusherOwned', null) === false) {
-        state.crusherOwned = null;
-        GM_setValue('crusherOwned', null);
-        state.autoCrusher = true;
-        GM_setValue('autoCrusher', true);
-        localStorage.removeItem('tmnCrusherLoopCount');
-        localStorage.removeItem('tmnPendingCrushName');
-        console.log('[TMN] v17.20 reset stale crusher-disabled state from previous build');
-      }
-      GM_setValue(crusherResetKey, true);
-    }
-  } catch (e) {
-    console.warn('[TMN] v17.20 crusher state reset failed:', e);
-  }
-
   let automationPaused = false;
 
   function saveState() {
@@ -925,6 +1483,7 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('autoBooze', state.autoBooze);
     GM_setValue('autoHealth', state.autoHealth);
     GM_setValue('autoGarage', state.autoGarage);
+    GM_setValue('autoBunker', state.autoBunker);
     GM_setValue('autoCrusher', state.autoCrusher);
     GM_setValue('crusherOwned', state.crusherOwned);
     GM_setValue('lastCrime', state.lastCrime);
@@ -933,6 +1492,19 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('lastBooze', state.lastBooze);
     GM_setValue('lastHealth', state.lastHealth);
     GM_setValue('lastGarage', state.lastGarage);
+    GM_setValue('lastBunkerCheck', state.lastBunkerCheck);
+    GM_setValue('bunkerCheckInProgress', state.bunkerCheckInProgress);
+    GM_setValue('autoBunkerExtend', state.autoBunkerExtend);
+    GM_setValue('bunkerExtendPending', state.bunkerExtendPending);
+    GM_setValue('bunkerExpiresAt', state.bunkerExpiresAt);
+    GM_setValue('autoScrapyard', state.autoScrapyard);
+    GM_setValue('lastScrapyardCheck', state.lastScrapyardCheck);
+    GM_setValue('scrapyardCheckInProgress', state.scrapyardCheckInProgress);
+    GM_setValue('autoTravelAfterDTM', state.autoTravelAfterDTM);
+    GM_setValue('pendingTravelBack', state.pendingTravelBack);
+    GM_setValue('travelBackQueuedAt', state.travelBackQueuedAt);
+    GM_setValue('lastHotCitySafetyCheck', state.lastHotCitySafetyCheck);
+    GM_setValue('travelBackInProgress', state.travelBackInProgress);
     GM_setValue('selectedCrimes', state.selectedCrimes);
     GM_setValue('selectedGTAs', state.selectedGTAs);
     GM_setValue('playerName', state.playerName);
@@ -1135,16 +1707,20 @@ if (currentPath.includes("/authenticated/")) {
         'selectedCrimes', 'selectedGTAs', 'playerName', 'inJail', 'crimeCollapsed', 'gtaCollapsed',
         'boozeCollapsed', 'panelMinimized', 'lastJailCheck', 'currentAction', 'needsRefresh', 'pendingAction',
         'autoOC', 'autoDTM',
-        'lastStaffScriptMailId', 'lastScriptTestMailId', 'lastNotifiedMailId', 'notifyStaffMailCheck',
+        'lastStaffScriptMailId', 'lastScriptTestMailId', 'lastNotifiedMailId', 'notifyStaffMailCheck', 'notifyInboxScriptTest',
+        'autoBunker', 'lastBunkerCheck', 'bunkerCheckInProgress',
+        'autoBunkerExtend', 'bunkerExtendPending', 'bunkerExpiresAt',
+        'autoScrapyard', 'lastScrapyardCheck', 'scrapyardCheckInProgress',
+        'autoTravelAfterDTM', 'pendingTravelBack', 'travelBackInProgress', 'travelBackQueuedAt', 'lastHotCitySafetyCheck',
 
         // Config values
         'crimeInterval', 'gtaInterval', 'jailbreakInterval', 'jailCheckInterval', 'boozeInterval',
-        'boozeBuyAmount', 'boozeSellAmount',
+        'boozeBuyAmount', 'boozeSellAmount', 'bunkerCheckInterval', 'scrapyardCheckInterval',
 
         // Action tracking
         'actionStartTime',
-
-
+        'bunkerCheckStartedAt',
+        'scrapyardCheckStartedAt',
 
         // Auto-Resume Config
         'autoResumeEnabled',
@@ -1285,14 +1861,6 @@ if (currentPath.includes("/authenticated/")) {
 
   const TELEGRAM_SEND_TIMEOUT_MS = 15000;
 
-  function setTelegramLastStatus(ok, detail) {
-    try {
-      GM_setValue('telegramLastSendOk', Boolean(ok));
-      GM_setValue('telegramLastSendAt', Date.now());
-      GM_setValue('telegramLastSendDetail', String(detail || '').substring(0, 300));
-    } catch {}
-  }
-
   function sendTelegramMessage(message) {
     console.log('[Telegram] Attempting to send message...');
 
@@ -1323,25 +1891,22 @@ if (currentPath.includes("/authenticated/")) {
       onload: function(response) {
         if (response.status === 200) {
           console.log('[Telegram] Message sent successfully!');
-          setTelegramLastStatus(true, 'Telegram message sent');
         } else {
           console.error('[Telegram] Failed to send message:', response.status);
           console.error('[Telegram] Response:', response.responseText);
-          setTelegramLastStatus(false, `HTTP ${response.status}: ${response.responseText || ''}`);
         }
       },
       onerror: function(error) {
         console.error('[Telegram] Network error:', error);
-        setTelegramLastStatus(false, error?.message || 'Telegram network error');
       },
       ontimeout: function() {
         console.error('[Telegram] Send timed out');
-        setTelegramLastStatus(false, 'Telegram send timed out');
       }
     });
   }
 
-
+  // Repeat a Telegram message N times with a small gap — used for high-urgency
+  // staff/script-test inbox alerts so they aren't easy to miss.
   function sendRepeatedTelegramMessage(message, count = 5, delayMs = 1500, label = 'Repeated alert') {
     const repeats = Math.max(1, Math.min(10, parseInt(count, 10) || 5));
     for (let i = 0; i < repeats; i++) {
@@ -1452,6 +2017,60 @@ if (currentPath.includes("/authenticated/")) {
     }
 
     return false;
+  }
+
+  // ---------------------------
+  // Bank Withdrawal Telegram Alert
+  // ---------------------------
+  // TMN renders a confirmation into the generic #ctl00_lblMsg/.TMNErrorFont
+  // message label after a bank withdrawal, e.g.:
+  //   "Money from your bank account has been given back to you with 5%
+  //    interest, a total of $36,750,000"
+  // Dedup key is the last-notified label text itself (localStorage-backed,
+  // survives reload/navigation) since the amount differs every time and
+  // there's no id to key off - an exact text match is enough to know we've
+  // already alerted on this particular withdrawal.
+  const LS_BANK_WITHDRAWAL_LAST_TEXT = 'tmnBankWithdrawalLastText';
+  const BANK_WITHDRAWAL_RE = /Money from your bank account has been given back to you with\s*([\d.]+)%\s*interest,\s*a total of\s*\$?\s*([\d,]+)/i;
+
+  function checkForBankWithdrawal() {
+    if (!telegramConfig.enabled || !telegramConfig.notifyBankWithdrawal) return false;
+
+    const msgEl = document.getElementById('ctl00_lblMsg');
+    if (!msgEl || !msgEl.classList.contains('TMNErrorFont')) return false;
+
+    const text = (msgEl.textContent || '').trim();
+    if (!text) return false;
+
+    const match = text.match(BANK_WITHDRAWAL_RE);
+    if (!match) return false;
+
+    let lastSent = '';
+    try {
+      lastSent = localStorage.getItem(LS_BANK_WITHDRAWAL_LAST_TEXT) || '';
+    } catch (e) { /* ignore storage errors */ }
+
+    if (lastSent === text) return false; // already alerted on this exact withdrawal
+
+    try {
+      localStorage.setItem(LS_BANK_WITHDRAWAL_LAST_TEXT, text);
+    } catch (e) { /* ignore storage errors */ }
+
+    const interestPct = match[1];
+    const amount = match[2];
+
+    console.log('[Telegram] Bank withdrawal detected:', text);
+
+    sendTelegramMessage(
+      '🏦 <b>Bank Withdrawal Detected!</b>\n\n' +
+      `Player: ${state.playerName || 'Unknown'}\n` +
+      `Amount: <b>$${amount}</b>\n` +
+      `Interest: ${interestPct}%\n` +
+      `Time: ${formatDateUK()}`
+    );
+
+    console.log('[Telegram] Bank withdrawal notification sent');
+    return true;
   }
 
   let captchaNotificationSent = false;
@@ -2029,7 +2648,6 @@ let logoutNotificationSent = false;
     const telegramCb = shadowRoot.querySelector('#tmn-online-watch-telegram');
     if (telegramCb) telegramCb.checked = onlineWatchConfig.telegramNotify;
   }
-
 
   // ---------------------------
   // Auto-Resume Script Check Functions
@@ -2937,18 +3555,20 @@ let logoutNotificationSent = false;
   // ============================================================
 
   // LocalStorage keys for OC/DTM mail tracking
-  const LS_LAST_OC_INVITE_MAIL_ID = "tmnLastOCInviteMailId";
+  const LS_LAST_OC_INVITE_MAIL_ID  = "tmnLastOCInviteMailId";
   const LS_LAST_DTM_INVITE_MAIL_ID = "tmnLastDTMInviteMailId";
-  const LS_LAST_OC_ACCEPT_TS = "tmnLastOCAcceptTs";
-  const LS_LAST_DTM_ACCEPT_TS = "tmnLastDTMAcceptTs";
-  const LS_PENDING_DTM_URL = "tmnPendingDTMAcceptURL";
-  const LS_PENDING_OC_URL = "tmnPendingOCAcceptURL";
+  const LS_LAST_DTM_COMPLETE_MAIL_ID = "tmnLastDTMCompleteMailId"; // v17.34
+  const DTM_COMPLETE_MAIL_DELETE_DELAY_MS = 40 * 60 * 1000; // v17.39 - delete confirmed completion mail 40 min after detection
+  const LS_LAST_OC_ACCEPT_TS       = "tmnLastOCAcceptTs";
+  const LS_LAST_DTM_ACCEPT_TS      = "tmnLastDTMAcceptTs";
+  const LS_PENDING_DTM_URL         = "tmnPendingDTMAcceptURL";
+  const LS_PENDING_OC_URL          = "tmnPendingOCAcceptURL";
 
   // Single unified watcher - no more separate OC/DTM/background watchers racing
-  const MAIL_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds
-  const INVITE_STALE_MS = 15 * 60 * 1000; // Ignore OC/DTM invites older than 15 minutes
-  const SCRIPT_TEST_MAIL_STALE_MS = 5 * 60 * 1000; // Ignore stale Script test inbox alerts
-  const GM_GET_TIMEOUT_MS = 20000; // Prevent hung background requests from stalling automation
+  const MAIL_CHECK_INTERVAL_MS     = 60000;            // Check every 60 seconds
+  const GM_GET_TIMEOUT_MS          = 20000;            // Prevent hung background requests from stalling automation
+  const INVITE_STALE_MS            = 15 * 60 * 1000;   // Ignore OC/DTM invites older than 15 minutes
+  const SCRIPT_TEST_MAIL_STALE_MS  = 5 * 60 * 1000;    // Ignore stale Script test inbox alerts
 
   // --- GM_xmlhttpRequest GET helper (returns html + finalUrl for redirect detection) ---
   function gmGet(url) {
@@ -2973,6 +3593,18 @@ let logoutNotificationSent = false;
         ontimeout: () => reject(new Error(`Timeout after ${GM_GET_TIMEOUT_MS}ms for ${url}`)),
       });
     });
+  }
+
+  // --- Small time helper used by the staff-mail/script-test alert age checks ---
+  function isOlderThanMs(timestamp, maxAgeMs) {
+    return timestamp > 0 && timestamp < (Date.now() - maxAgeMs);
+  }
+
+  // --- Inbox "Script test" title detector ---
+  function isScriptTestInboxMessage(subject, rowText) {
+    const title = String(subject || '').trim();
+    const full = String(rowText || '');
+    return /^script\s*test$/i.test(title) || /\bscript\s*test\b/i.test(full);
   }
 
   // --- Normalize mailbox link to authenticated URL ---
@@ -3011,28 +3643,6 @@ let logoutNotificationSent = false;
     // Use UTC — TMN server times are in UTC, not local time
     return Date.UTC(Number(yyyy), Number(mm) - 1, Number(dd), Number(HH), Number(MM), Number(SS || 0));
   }
-
-
-  function isOlderThanMs(timestamp, maxAgeMs) {
-    return timestamp > 0 && timestamp < (Date.now() - maxAgeMs);
-  }
-
-  function shouldSkipUnparseableInvite(kind, mailId, lastSeen, storageKey) {
-    // If TMN changes the mailbox date format and we cannot parse the row time,
-    // do not treat pre-existing inbox rows as new invites on startup.
-    if (lastSeen) return parseInt(mailId, 10) <= parseInt(lastSeen, 10);
-    localStorage.setItem(storageKey, mailId);
-    console.log(`[TMN][MAIL] ${kind} invite skipped — no parseable date and no baseline yet; saved mailId=${mailId}`);
-    return true;
-  }
-
-  function isScriptTestInboxMessage(subject, rowText) {
-    const title = String(subject || '').trim();
-    const full = String(rowText || '');
-    return /^script\s*test$/i.test(title) || /\bscript\s*test\b/i.test(full);
-  }
-
-  // --- Find newest DTM invitation mail ---
 
   // --- Open DTM mail and extract accept URL ---
   async function getDTMAcceptURLFromMail(mailHref) {
@@ -3087,8 +3697,6 @@ let logoutNotificationSent = false;
     return toAuthenticatedURL(acceptA.getAttribute("href"));
   }
 
-  // --- Find newest OC invitation mail ---
-
   // --- Open OC mail and extract accept URL ---
   async function getOCAcceptURLFromMail(mailHref) {
     const mailURL = toAuthenticatedMailboxURL(mailHref);
@@ -3121,14 +3729,30 @@ let logoutNotificationSent = false;
     return toAuthenticatedURL(acceptA.getAttribute("href"));
   }
 
+  // --- Open a mail and check if it's a DTM completion notice (v17.34) ---
+  // Confirmed body text (from a real completion mail): "Congratulations,
+  // <partner> and you successfully completed a Drugs Transportation
+  // Mission in <City> - <Country>. Both participants earned $X from this
+  // mission! Additionally, you managed to find and smuggle N <FMJ/JHP>
+  // bullets." The mail's bold header is "Drugs Transportation Mission" -
+  // same wording an invite mail might use, so this checks the more specific
+  // "successfully completed a Drugs Transportation Mission" phrase rather
+  // than just the header text, to avoid confusing it with an invite.
+  async function checkMailForDTMCompletion(mailHref) {
+    const mailURL = toAuthenticatedMailboxURL(mailHref);
+    const mailRes = await gmGet(mailURL);
+    if (!/\/authenticated\/mailbox\.aspx/i.test(mailRes.finalUrl)) return false;
+    return /successfully completed a drugs transportation mission/i.test(mailRes.html || '');
+  }
+
   // ============================================================
   // UNIFIED MAIL WATCHER - Single system handles OC, DTM, and general messages
   // Runs via gmGet (background HTTP) so works regardless of current page
   // Stores pending invites in localStorage so they survive page navigations
   // ============================================================
 
-  // All tracking is now via localStorage - no in-memory state that gets wiped on page nav
-
+  // All tracking is now via localStorage - no in-memory state that gets wiped on page nav.
+  // In-flight lock prevents overlapping mailbox scans (v17.22 reliability fix).
   let unifiedMailCheckInProgress = false;
 
   async function unifiedMailCheck() {
@@ -3139,8 +3763,12 @@ let logoutNotificationSent = false;
     unifiedMailCheckInProgress = true;
     try {
       if (!tabManager.isMasterTab) return;
-      // Need at least OC/DTM enabled or a Telegram inbox/mail alert enabled
-      if (!state.autoOC && !state.autoDTM && !(telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck))) return;
+      // Need at least OC/DTM enabled, Auto Travel (watches for DTM
+      // completion mail - v17.34), Auto Extend Bunker (watches for the
+      // bunker expiry warning mail - v17.41), or a Telegram inbox/mail
+      // alert enabled
+      if (!state.autoOC && !state.autoDTM && !state.autoTravelAfterDTM && !state.autoBunkerExtend &&
+          !(telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck))) return;
 
       const inboxURL = `${location.origin}/authenticated/mailbox.aspx?p=m`;
       const inboxRes = await gmGet(inboxURL);
@@ -3219,6 +3847,78 @@ let logoutNotificationSent = false;
 
         // Check DTM invite - use localStorage to track if already processed
         const isDTMInvite = /(dtm\s*invitation|dtm\s*invite|drug\s*trade)/i.test(rowText);
+
+        // v17.34 - Check DTM completion mail (4th trigger for the travel-
+        // back queue, alongside Complete DTM button + the two buy-drugs
+        // paths). Cheap first-pass filter on the row text ("drugs
+        // transportation mission", excluding anything that already matched
+        // as an invite above), then open the mail to confirm the more
+        // specific "successfully completed..." phrase before treating it as
+        // a real completion signal - row text alone isn't guaranteed to be
+        // specific enough to tell an invite and a completion notice apart.
+        // v17.39 - detection/confirmation no longer requires
+        // autoTravelAfterDTM - only the pendingTravelBack queuing below
+        // does. Once confirmed, the mail is queued for auto-deletion 40 min
+        // later (reusing the same scheduleMailDeletion/
+        // checkAndProcessMailDeletions machinery as accepted invite mails),
+        // unconditionally, so it stops sitting in the inbox where a later
+        // scan could re-trip the loose row-text filter and interfere with
+        // the auto-travel system.
+        const looksLikeDTMComplete = !isDTMInvite && /drugs\s*transportation\s*mission/i.test(rowText);
+        if (looksLikeDTMComplete) {
+          const lastSeenComplete = localStorage.getItem(LS_LAST_DTM_COMPLETE_MAIL_ID);
+          if (lastSeenComplete !== mailId) {
+            localStorage.setItem(LS_LAST_DTM_COMPLETE_MAIL_ID, mailId);
+            try {
+              const confirmed = await checkMailForDTMCompletion(href);
+              if (confirmed) {
+                console.log(`[TMN][TRAVEL-BACK] DTM completion mail confirmed (id=${mailId})`);
+                if (state.autoTravelAfterDTM) {
+                  state.pendingTravelBack = true;
+                  state.travelBackQueuedAt = Date.now();
+                  saveState();
+                  console.log('[TMN][TRAVEL-BACK] Will travel back via private jet in 22 minutes');
+                }
+                scheduleMailDeletion(mailId, DTM_COMPLETE_MAIL_DELETE_DELAY_MS);
+                console.log(`[TMN][MAIL] DTM completion mail ${mailId} queued for deletion in 40 min`);
+              } else {
+                console.log(`[TMN][TRAVEL-BACK] Mail id=${mailId} matched the loose filter but not the confirmed completion phrase - skipped`);
+              }
+            } catch (e) {
+              console.warn('[TMN][TRAVEL-BACK] Error checking mail for DTM completion:', e);
+            }
+          }
+        }
+
+        // v17.41/v17.42 - Auto Extend Bunker: trigger the extension from
+        // mail activity without ever opening a mail body or relying on a
+        // bunker-page visit. v17.41 tried matching mail content directly,
+        // but the confirmed real mail (subject "hello", sender "Scream")
+        // has nothing bunker-related in it at all - it's just an ordinary
+        // mail. So instead: use each mail row's OWN timestamp (already
+        // parseable from the row text via parseTMNDateFromText, same
+        // helper the DTM/OC dedup layers use) as a fresh "now" reference,
+        // and compare it against state.bunkerExpiresAt - the expiry
+        // timestamp cached from the last bunker-page label read (see
+        // doBunkerSubmit). Any mail arriving within 48h of that cached
+        // expiry queues the extension. This needs the bunker page to have
+        // been read at least once to know bunkerExpiresAt in the first
+        // place, but after that, ordinary mailbox activity alone is enough
+        // to notice the 48h window and trigger - no further page visit or
+        // mail-opening required.
+        if (state.autoBunkerExtend && !state.bunkerExtendPending && state.bunkerExpiresAt > 0) {
+          const mailTs = parseTMNDateFromText(rowText);
+          if (mailTs > 0) {
+            const msRemaining = state.bunkerExpiresAt - mailTs;
+            if (msRemaining <= BUNKER_EXT_THRESHOLD_MS) {
+              const hoursLeft = (msRemaining / (1000 * 60 * 60)).toFixed(1);
+              console.log(`[TMN][BUNKER-EXT] ${hoursLeft}h left, per mail id=${mailId} timestamp (<=48h) - queuing extension`);
+              state.bunkerExtendPending = true;
+              saveState();
+            }
+          }
+        }
+
         if (isDTMInvite && !state.autoDTM) {
           // Auto DTM is off — mark as seen so we don't re-detect it every scan cycle
           localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
@@ -3247,18 +3947,18 @@ let logoutNotificationSent = false;
             continue;
           }
 
-          // DEDUP LAYER 4: Age check — skip if mail is 15 minutes old or older
+          // DEDUP LAYER 4: Age check — skip if mail is older than 15 minutes
           const inviteTs = parseTMNDateFromText(rowText);
-          if (isOlderThanMs(inviteTs, INVITE_STALE_MS)) {
-            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 4 (15min+ old) — age: ${Math.round((Date.now() - inviteTs) / 60000)}min`);
+          const fifteenMinAgo = Date.now() - (15 * 60 * 1000);
+          if (inviteTs > 0 && inviteTs < fifteenMinAgo) {
+            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 4 (older than 15min) — age: ${Math.round((Date.now() - inviteTs) / 60000)}min`);
             localStorage.setItem(LS_LAST_DTM_INVITE_MAIL_ID, mailId);
             continue;
           }
 
-          // DEDUP LAYER 5: If we can't parse the date, only accept mail IDs higher than an existing baseline.
-          // With no baseline, save this row as seen and skip it so old inbox rows cannot be processed on startup.
-          if (inviteTs === 0 && shouldSkipUnparseableInvite('DTM', mailId, lastSeen, LS_LAST_DTM_INVITE_MAIL_ID)) {
-            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 5 (unparseable/baseline) — mailId=${mailId} lastSeen=${lastSeen || 'none'}`);
+          // DEDUP LAYER 5: If we can't parse the date, only accept if mail ID is HIGHER than last seen
+          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
+            console.log(`[TMN][MAIL] DTM BLOCKED by Layer 5 (ID ordering) — mailId=${mailId} lastSeen=${lastSeen}`);
             continue;
           }
 
@@ -3297,18 +3997,18 @@ let logoutNotificationSent = false;
             continue;
           }
 
-          // DEDUP LAYER 4: Age check — skip if mail is 15 minutes old or older
+          // DEDUP LAYER 4: Age check — skip if mail is older than 15 minutes
           const inviteTs = parseTMNDateFromText(rowText);
-          if (isOlderThanMs(inviteTs, INVITE_STALE_MS)) {
-            console.log(`[TMN][MAIL] OC invite skipped — 15min+ old (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
+          const fifteenMinAgo = Date.now() - (15 * 60 * 1000);
+          if (inviteTs > 0 && inviteTs < fifteenMinAgo) {
+            console.log(`[TMN][MAIL] OC invite skipped — older than 15min (age: ${Math.round((Date.now() - inviteTs) / 60000)}min)`);
             localStorage.setItem(LS_LAST_OC_INVITE_MAIL_ID, mailId);
             continue;
           }
 
-          // DEDUP LAYER 5: If date unparseable, only accept if mail ID is higher than an existing baseline.
-          // With no baseline, save this row as seen and skip it so old inbox rows cannot be processed on startup.
-          if (inviteTs === 0 && shouldSkipUnparseableInvite('OC', mailId, lastSeen, LS_LAST_OC_INVITE_MAIL_ID)) {
-            console.log(`[TMN][MAIL] OC invite skipped — unparseable date/baseline mailId=${mailId} lastSeen=${lastSeen || 'none'}`);
+          // DEDUP LAYER 5: If date unparseable, only accept if mail ID is higher than last seen
+          if (inviteTs === 0 && lastSeen && parseInt(mailId) <= parseInt(lastSeen)) {
+            console.log(`[TMN][MAIL] OC invite skipped — mail ID ${mailId} <= last seen ${lastSeen} (unparseable date)`);
             continue;
           }
 
@@ -3403,7 +4103,7 @@ let logoutNotificationSent = false;
             // Advance high-water mark IMMEDIATELY
             GM_setValue('lastNotifiedMailId', numericMailId);
 
-            // Age check: only notify for recent mails (last 2 minutes)
+            // Age check: only notify for recent mails (last 5 minutes)
             const mailTs = parseTMNDateFromText(rowText);
             const fiveMinAgo = Date.now() - (5 * 60 * 1000);
             if (mailTs > 0 && mailTs < fiveMinAgo) {
@@ -3502,7 +4202,7 @@ let logoutNotificationSent = false;
   // invite mail regardless of any other dedup layer failing. Entries expire
   // after 24h to keep localStorage small.
   const LS_ALERTED_INVITE_MAILS = "tmnAlertedInviteMails";
-  const ALERTED_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  const ALERTED_TTL_MS          = 24 * 60 * 60 * 1000; // 24 hours
 
   function _loadAlertedMails() {
     try {
@@ -3600,6 +4300,9 @@ let logoutNotificationSent = false;
       // Store the URL in localStorage so it survives page navigations
       localStorage.setItem(LS_PENDING_DTM_URL, acceptURL);
 
+      // Queue this invite mail for deletion 5 minutes from now
+      scheduleMailDeletion(mailId);
+
       // DON'T navigate here - mainLoop Priority 2 will pick it up on next tick
       // This avoids race conditions with concurrent mainLoop navigation
       console.log('[TMN][MAIL] DTM accept URL stored in localStorage. MainLoop will process it.');
@@ -3672,13 +4375,15 @@ let logoutNotificationSent = false;
       // Store in localStorage so it survives page navigations
       localStorage.setItem(LS_PENDING_OC_URL, acceptURL);
 
+      // Queue this invite mail for deletion 5 minutes from now
+      scheduleMailDeletion(mailId);
+
       // DON'T navigate here - mainLoop Priority 2 will pick it up on next tick
       console.log('[TMN][MAIL] OC accept URL stored in localStorage. MainLoop will process it.');
     } catch (e) {
       console.warn('[TMN][MAIL] handleNewOCInvite error:', e);
     }
   }
-
 
   // ============================================================
   // OC PAGE HANDLER - Weapon/Explosive/Car selection after accepting
@@ -3704,14 +4409,12 @@ let logoutNotificationSent = false;
       if (retryUrl) {
         console.log('[TMN][AUTO-OC] Not on OC page, re-navigating to accept URL');
         localStorage.removeItem(LS_PENDING_OC_URL);
-        scheduleOCDTMAction('Re-opening OC invite', () => {
-          try {
-            const u = new URL(retryUrl);
-            window.location.href = u.pathname + u.search;
-          } catch {
-            window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
-          }
-        });
+        try {
+          const u = new URL(retryUrl);
+          window.location.href = u.pathname + u.search;
+        } catch {
+          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
         return true;
       }
       return false;
@@ -3865,14 +4568,12 @@ let logoutNotificationSent = false;
       if (retryUrl) {
         console.log('[TMN][AUTO-DTM] Not on DTM page, re-navigating to accept URL');
         localStorage.removeItem(LS_PENDING_DTM_URL);
-        scheduleOCDTMAction('Re-opening DTM invite', () => {
-          try {
-            const u = new URL(retryUrl);
-            window.location.href = u.pathname + u.search;
-          } catch {
-            window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
-          }
-        });
+        try {
+          const u = new URL(retryUrl);
+          window.location.href = u.pathname + u.search;
+        } catch {
+          window.location.href = retryUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
         return true;
       }
       return false;
@@ -3914,6 +4615,16 @@ let logoutNotificationSent = false;
         // Set cooldown
         const dtmCooldown = { canDTM: false, totalSeconds: 7200, hours: 2, minutes: 0, seconds: 0, message: "DTM completed", lastUpdate: Date.now() };
         storeDTMTimerData(dtmCooldown);
+
+        // v17.32 - queue a travel back to the current hot city via private
+        // jet, after a fixed 22-minute wait (was: real travel cooldown +
+        // normal travel button). See doTravelBackToHotCity().
+        if (state.autoTravelAfterDTM) {
+          state.pendingTravelBack = true;
+          state.travelBackQueuedAt = Date.now();
+          saveState();
+          console.log('[TMN][TRAVEL-BACK] DTM completed - will travel back via private jet in 22 minutes');
+        }
 
         updateStatus("✅ DTM completed — resuming automation");
         sendTelegramMessage(
@@ -4027,6 +4738,20 @@ let logoutNotificationSent = false;
         localStorage.removeItem('tmnPendingDTMHandleTs');
         localStorage.setItem(LS_LAST_DTM_ACCEPT_TS, String(Date.now())); // Cooldown starts on COMPLETION only
         state.isPerformingAction = false;
+
+        // v17.33 - this DTM-completion path (buy max drugs) previously
+        // didn't queue a travel-back, unlike the Complete DTM button path.
+        // saveState() here (unlike surrounding lines) because buyButton's
+        // click triggers a reload shortly after - without flushing to GM
+        // storage now, pendingTravelBack would be lost before the next
+        // mainLoop tick ever sees it.
+        if (state.autoTravelAfterDTM) {
+          state.pendingTravelBack = true;
+          state.travelBackQueuedAt = Date.now();
+          saveState();
+          console.log('[TMN][TRAVEL-BACK] DTM completed (buy max drugs) - will travel back via private jet in 22 minutes');
+        }
+
         updateStatus("✅ DTM drugs bought — resuming automation");
         sendTelegramMessage(
           '🚚 <b>DTM Drugs Bought!</b>\n\n' +
@@ -4052,6 +4777,17 @@ let logoutNotificationSent = false;
         localStorage.removeItem('tmnPendingDTMHandle');
         localStorage.removeItem('tmnPendingDTMHandleTs');
         state.isPerformingAction = false;
+
+        // v17.33 - this DTM-completion path (buy prefilled drugs) previously
+        // didn't queue a travel-back either. saveState() here since
+        // buyButton's click triggers a reload shortly after.
+        if (state.autoTravelAfterDTM) {
+          state.pendingTravelBack = true;
+          state.travelBackQueuedAt = Date.now();
+          saveState();
+          console.log('[TMN][TRAVEL-BACK] DTM completed (buy prefilled drugs) - will travel back via private jet in 22 minutes');
+        }
+
         updateStatus("✅ DTM drugs bought — resuming automation");
       });
       return true;
@@ -4180,6 +4916,148 @@ let logoutNotificationSent = false;
     } catch (e) { return null; }
   }
 
+  // ============================================================
+  // AUTO-DELETE ACCEPTED OC/DTM INVITE MAILS (5 min after accept)
+  // ============================================================
+  // When an OC/DTM invite is actually accepted, its mail ID is queued here with a
+  // due timestamp. Once due, the next mainLoop tick opens the mailbox, ticks that
+  // one row and clicks Delete. Queue lives in localStorage so it survives page navs.
+  const LS_PENDING_MAIL_DELETIONS = 'tmnPendingMailDeletions'; // { mailId: dueTs }
+  const MAIL_DELETE_DELAY_MS  = 5 * 60 * 1000;   // delete 5 minutes after accepting
+  const MAIL_DELETE_GIVEUP_MS = 30 * 60 * 1000;  // drop entry if still unresolved 30min past due
+
+  function getPendingMailDeletions() {
+    try {
+      const raw = localStorage.getItem(LS_PENDING_MAIL_DELETIONS);
+      if (!raw) return {};
+      const obj = JSON.parse(raw);
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch { return {}; }
+  }
+
+  function savePendingMailDeletions(obj) {
+    try {
+      localStorage.setItem(LS_PENDING_MAIL_DELETIONS, JSON.stringify(obj || {}));
+    } catch (e) {
+      console.warn('[TMN][MAIL] Failed to save pending deletions:', e);
+    }
+  }
+
+  function scheduleMailDeletion(mailId, delayMs = MAIL_DELETE_DELAY_MS) {
+    if (!mailId) return;
+    const obj = getPendingMailDeletions();
+    obj[String(mailId)] = Date.now() + delayMs;
+    savePendingMailDeletions(obj);
+    console.log(`[TMN][MAIL] Queued mail ${mailId} for deletion in ${Math.round(delayMs / 60000)} min`);
+  }
+
+  // Tick exactly one row and click Delete. Returns:
+  //   'clicked'    — delete submitted (page will post back)
+  //   'not-found'  — row isn't in the grid any more (already deleted) -> drop entry
+  //   'no-control' — grid present but no usable checkbox/delete button -> retry later
+  function deleteMailMessageById(mailId) {
+    const grid = document.getElementById('ctl00_main_gridMail');
+    if (!grid) return 'no-control';
+
+    const rows = Array.from(grid.querySelectorAll('tr')).slice(1);
+    let targetRow = null;
+    for (const row of rows) {
+      const link = [...row.querySelectorAll('a[href*="mailbox.aspx"]')].find(a =>
+        /[?&]id=\d+/i.test(a.getAttribute('href') || '')
+      );
+      if (link && parseMailIdFromHref(link.getAttribute('href')) === String(mailId)) {
+        targetRow = row;
+        break;
+      }
+    }
+    if (!targetRow) return 'not-found';
+
+    const checkbox = targetRow.querySelector('input[type="checkbox"]');
+    if (!checkbox) return 'no-control';
+
+    // Tick the row FIRST — the Delete button may only render once a row is selected.
+    grid.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+    checkbox.checked = true;
+    try { checkbox.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+    try { checkbox.dispatchEvent(new Event('click',  { bubbles: true })); } catch (e) {}
+
+    const ticked = Array.from(grid.querySelectorAll('input[type="checkbox"]')).filter(c => c.checked).length;
+    if (ticked !== 1) {
+      console.warn(`[TMN][MAIL] Delete safety abort — expected 1 ticked box, found ${ticked}`);
+      return 'no-control';
+    }
+
+    const deleteBtn =
+      document.getElementById('ctl00_main_btnDelMessage') ||
+      document.querySelector('input[name="ctl00$main$btnDelMessage"]') ||
+      document.querySelector('input[id*="btnDelMessage"], input[id*="btnDelete"]') ||
+      Array.from(document.querySelectorAll('input[type="submit"], button')).find(b =>
+        /^delete$/i.test(((b.value || b.textContent || '')).trim())
+      );
+
+    if (!deleteBtn || deleteBtn.disabled) {
+      console.log(`[TMN][MAIL] Row ${mailId} ticked but Delete button not available yet — will retry`);
+      checkbox.checked = false;
+      return 'no-control';
+    }
+
+    console.log(`[TMN][MAIL] Deleting invite mail ${mailId}`);
+    deleteBtn.click();
+    return 'clicked';
+  }
+
+  // Returns true if it navigated or submitted something (caller should yield).
+  function checkAndProcessMailDeletions() {
+    if (!tabManager.isMasterTab) return false;
+
+    const pending = getPendingMailDeletions();
+    const ids = Object.keys(pending);
+    if (!ids.length) return false;
+
+    const now = Date.now();
+    let changed = false;
+    const due = [];
+
+    for (const id of ids) {
+      const dueTs = Number(pending[id]);
+      if (!dueTs || isNaN(dueTs)) { delete pending[id]; changed = true; continue; }
+      if (now >= dueTs + MAIL_DELETE_GIVEUP_MS) {
+        console.log(`[TMN][MAIL] Giving up on deleting mail ${id} (too old)`);
+        delete pending[id];
+        changed = true;
+        continue;
+      }
+      if (now >= dueTs) due.push(id);
+    }
+    if (changed) savePendingMailDeletions(pending);
+    if (!due.length) return false;
+
+    // Not on the mailbox page — go there first
+    if (getCurrentPage() !== 'mailbox') {
+      console.log(`[TMN][MAIL] ${due.length} invite mail(s) due for deletion — opening mailbox`);
+      updateStatus('Deleting accepted invite mail...');
+      safeNavigate('/authenticated/mailbox.aspx?p=m&' + Date.now());
+      return true;
+    }
+
+    // On the mailbox page — handle ONE per visit (delete causes a postback)
+    for (const id of due) {
+      const result = deleteMailMessageById(id);
+      if (result === 'clicked') {
+        delete pending[id];
+        savePendingMailDeletions(pending);
+        updateStatus(`Invite mail ${id} deleted`);
+        return true;
+      }
+      if (result === 'not-found') {
+        console.log(`[TMN][MAIL] Mail ${id} no longer in inbox — clearing from queue`);
+        delete pending[id];
+        savePendingMailDeletions(pending);
+      }
+    }
+    return false;
+  }
+
   // Next function should be formatTime()
   function formatTime(timestamp) {
     if (!timestamp) return 'Never';
@@ -4202,9 +5080,13 @@ let logoutNotificationSent = false;
     if (path.includes('players.aspx')) return 'players';
     if (path.includes('resetscriptcounter.aspx')) return 'captcha';
     if (path.includes('playerproperty.aspx') && search.includes('p=g')) return 'garage';
+    // v17.24 - base playerproperty.aspx (no p= param) shows Money/Credits/Bullets
+    // and the Artillery Bunker panel by default.
+    if (path.includes('playerproperty.aspx') && !search.includes('p=')) return 'bunker';
     if (path.includes('credits.aspx')) return 'credits';
     if (path.includes('travel.aspx')) return 'travel';
     if (path.includes('store.aspx') && search.includes('p=b')) return 'store';
+    if (path.includes('store.aspx') && search.includes('p=s')) return 'scrapyard';
     if (path.includes('mailbox.aspx')) return 'mailbox';
     return 'other';
   }
@@ -4720,7 +5602,7 @@ let logoutNotificationSent = false;
         const sellAmount = Math.min(config.boozeSellAmount, currentInventory);
         sellInput.value = sellAmount;
         updateStatus(`Selling ${sellAmount} booze units...`);
-        submitAspNetButton(sellBtn);
+        sellBtn.click();
 
         state.lastBooze = now;
         state.needsRefresh = true;
@@ -4917,6 +5799,118 @@ let logoutNotificationSent = false;
   }
 
   // ---------------------------
+  // Artillery Bunker 14-Day Extension (v17.31, ported v17.36)
+  // ---------------------------
+  // Kept as a separate opt-in from bullet deposits (autoBunker) since this
+  // spends 75 credits - its toggle lives in the Settings page, not the main
+  // toggle grid. Detection happens as a side-effect of the existing bunker
+  // page visit in doBunkerSubmit() (no extra navigation needed to notice
+  // it's due); the purchase itself reuses the exact same navigate-to-
+  // Credits-page + click-and-reload pattern as checkAndBuyHealth above,
+  // since it's the same page and the same kind of action.
+
+  // Bunker expiry is shown as "D-M-YYYY HH:MM:SS" (day-month-year - a
+  // reading like "5-8-2026" as Aug 5 fits a few days out from today,
+  // whereas May 8 would already be in the past). Returns a timestamp, or
+  // null if the text doesn't match.
+  function parseBunkerExpireDate(text) {
+    // v17.40 - was anchored (^...$), which required the label's ENTIRE
+    // trimmed text to be nothing but the date. The real label is a full
+    // sentence with the date embedded in the middle - e.g. "Your bunker
+    // will blow up on 5-8-2026 00:03:09 unless you extend it from the
+    // Credits page before that." - so the anchored version never matched
+    // anything, ever, and bunkerExtendPending never got set (silently -
+    // only a console.log, nothing visible in the on-screen status).
+    // Un-anchored: pull the D-M-YYYY HH:MM:SS pattern out of wherever it
+    // sits in the sentence instead of requiring an exact full-string match.
+    const m = (text || '').match(/(\d{1,2})-(\d{1,2})-(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})/);
+    if (!m) return null;
+    const day = parseInt(m[1], 10);
+    const month = parseInt(m[2], 10);
+    const year = parseInt(m[3], 10);
+    const hour = parseInt(m[4], 10);
+    const minute = parseInt(m[5], 10);
+    const second = parseInt(m[6], 10);
+    // v17.42 - was `new Date(year, month-1, day, ...)`, which builds the
+    // timestamp in the BROWSER's local timezone. parseTMNDateFromText
+    // (used for mail row timestamps, right above) already notes TMN server
+    // times are UTC and uses Date.UTC() for exactly that reason. Comparing
+    // a UTC mail timestamp against a locally-interpreted expiry silently
+    // skews the "hours left" math by the browser's UTC offset (e.g. UK
+    // BST = UTC+1 in summer) - close enough to explain why the 24h gate
+    // could fire early/late/never depending on time of year and machine.
+    // Switched to Date.UTC() so both timestamps are apples-to-apples.
+    const ts = Date.UTC(year, month - 1, day, hour, minute, second);
+    return isNaN(ts) ? null : ts;
+  }
+
+  const BUNKER_EXT_COST = 75; // credits, from the Credits page "Purchase items" table
+  const BUNKER_EXT_THRESHOLD_MS = 48 * 60 * 60 * 1000; // only act with <=48h left
+
+  function checkAndExtendBunker() {
+    if (!state.autoBunkerExtend || state.isPerformingAction || automationPaused) return;
+    if (!state.bunkerExtendPending) return; // Nothing queued - nothing to do
+
+    const credits = getCredits();
+
+    if (credits < BUNKER_EXT_COST) {
+      // Cheap check, no navigation - just wait and try again next tick in
+      // case credits arrive. Doesn't disable the toggle (unlike Auto
+      // Health) since a 75-credit lump sum recurring every ~14 days is a
+      // normal thing to not have on hand every moment it's checked.
+      updateStatus(`Bunker expiring soon - need ${BUNKER_EXT_COST} credits (have ${credits})`);
+      return;
+    }
+
+    // If not on credits page, navigate there
+    if (!/\/authenticated\/credits\.aspx$/i.test(location.pathname)) {
+      updateStatus("Bunker expiring soon - navigating to buy extension");
+      console.log('[TMN][BUNKER-EXT] Navigating to Credits page to extend bunker');
+      setTimeout(() => location.href = '/authenticated/credits.aspx', 1500);
+      return;
+    }
+
+    // On credits page - buy the extension
+    const extBtn = document.querySelector('#ctl00_main_btnArtilleryBunkerExt');
+    if (extBtn) {
+      state.isPerformingAction = true;
+      state.currentAction = 'bunkerExtend';
+      GM_setValue('actionStartTime', Date.now());
+      saveState();
+      console.log(`[TMN][BUNKER-EXT] Buying Artillery Bunker 14-day extension (${BUNKER_EXT_COST} credits)`);
+      updateStatus(`Extending Artillery Bunker (14 days, ${BUNKER_EXT_COST} credits)...`);
+      extBtn.click();
+
+      setTimeout(() => {
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        state.bunkerExtendPending = false;
+        // v17.42 - clear the cached expiry too: it's now 14 days stale, so
+        // leaving it in place would make the mail-scan trigger immediately
+        // re-fire bunkerExtendPending off the old timestamp on the very
+        // next mail. It'll get repopulated next time the bunker page is
+        // visited (doBunkerSubmit).
+        state.bunkerExpiresAt = 0;
+        saveState();
+        updateStatus("✅ Artillery Bunker extended 14 days");
+        sendTelegramMessage(
+          '🔫 <b>Bunker Extended</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `+14 days for ${BUNKER_EXT_COST} credits`
+        );
+        location.reload();
+      }, 1500);
+    } else {
+      // Button not found - Credits page layout may have changed. Don't
+      // clear bunkerExtendPending; it'll simply retry on the next tick /
+      // next visit rather than silently giving up.
+      console.log('[TMN][BUNKER-EXT] Extend button not found on Credits page');
+      updateStatus("Bunker extend button not found on Credits page");
+    }
+  }
+
+  // ---------------------------
   // Garage Functions
   // ---------------------------
   // Known car catalog with default categories.
@@ -4987,11 +5981,11 @@ let logoutNotificationSent = false;
     return !!(known && known.manual);
   }
 
-
   // Robust garage row parser. TMN has changed garage table column order before,
   // so do not rely on row.children[1] for the car name or row.children[4] for damage.
   // This finds the known car model anywhere in the row text and extracts the first
-  // percentage-looking value as damage. It also keeps a safe fallback for unknown cars.
+  // percentage-looking value as damage. It also returns damageParsed so the crusher
+  // can tell "0% damage" apart from "couldn't read damage" and skip the latter.
   function escapeRegExp(str) {
     return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
@@ -5027,50 +6021,16 @@ let logoutNotificationSent = false;
     let damage = 0;
     const pctMatch = text.match(/(\d{1,3})\s*%/);
     if (pctMatch) damage = Math.max(0, Math.min(100, parseInt(pctMatch[1], 10) || 0));
+    // damageParsed lets the crusher distinguish a genuine 0% from an unreadable cell.
+    const damageParsed = !!pctMatch;
 
     return {
       carName,
       damage,
+      damageParsed,
       checkbox: row ? row.querySelector('input[type="checkbox"]') : null,
       text
     };
-  }
-
-  function setGarageCheckboxChecked(cb, checked) {
-    if (!cb) return;
-    cb.checked = !!checked;
-    // ASP.NET pages and custom JS sometimes read change/click state rather than
-    // only the property, so dispatch both lightweight events after changing it.
-    try { cb.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) {}
-    try { cb.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
-  }
-
-  function submitAspNetButton(btn) {
-    if (!btn) return false;
-    try {
-      const form = btn.form || document.forms[0];
-      const name = btn.getAttribute('name');
-      if (form && name) {
-        const prev = form.querySelector('input[data-tmn-submit="1"]');
-        if (prev) prev.remove();
-        const hidden = document.createElement('input');
-        hidden.type = 'hidden';
-        hidden.name = name;
-        hidden.value = btn.value || btn.textContent || '';
-        hidden.setAttribute('data-tmn-submit', '1');
-        form.appendChild(hidden);
-        if (typeof form.requestSubmit === 'function') {
-          form.requestSubmit(btn);
-        } else {
-          form.submit();
-        }
-        return true;
-      }
-    } catch (e) {
-      console.warn('[TMN] ASP.NET button submit fallback failed, using click:', e);
-    }
-    btn.click();
-    return true;
   }
 
   // ---------------------------
@@ -5085,14 +6045,14 @@ let logoutNotificationSent = false;
   // by the crusher and falls through to Step 1b's sell path. Once the cooldown
   // expires, crushing that model resumes — by then the gifted one has been sold
   // and any new one is almost certainly stolen. Per-player scoped.
-  const LS_GIFTED_MODELS_PREFIX = 'tmnGiftedModels_';
-  const LS_PENDING_CRUSH_NAME = 'tmnPendingCrushName';
-  const LS_CRUSHER_FULL_UNTIL = 'tmnCrusherFullUntil';
-  const LS_CRUSHER_LOOP_COUNT = 'tmnCrusherLoopCount';
-  const CRUSHER_ERROR_REGEX = /you can only crush cars that you stole yourself/i;
-  const CRUSHER_FULL_REGEX = /crusher queue full|daily capacity reached/i;
-  const CRUSHER_FULL_PAUSE_MS = 60 * 60 * 1000;   // 1 hour
-  const GIFTED_MODEL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+  const LS_GIFTED_MODELS_PREFIX  = 'tmnGiftedModels_';
+  const LS_PENDING_CRUSH_NAME    = 'tmnPendingCrushName';
+  const LS_CRUSHER_FULL_UNTIL    = 'tmnCrusherFullUntil';
+  const LS_CRUSHER_LOOP_COUNT    = 'tmnCrusherLoopCount';
+  const CRUSHER_ERROR_REGEX      = /you can only crush cars that you stole yourself/i;
+  const CRUSHER_FULL_REGEX       = /crusher queue full|daily capacity reached/i;
+  const CRUSHER_FULL_PAUSE_MS    = 60 * 60 * 1000;   // 1 hour
+  const GIFTED_MODEL_COOLDOWN_MS = 30 * 60 * 1000;   // 30 minutes
   const CRUSHER_LOOP_SAFETY_LIMIT = 3; // After N failed crush attempts in a row, assume no crusher and auto-disable
 
   function _giftedKey() {
@@ -5236,14 +6196,17 @@ let logoutNotificationSent = false;
     GM_setValue('actionStartTime', now);
 
     // Step 1a: Send crusher cars to crusher
-    // Gated on: Auto Crusher toggle on, crusherOwned not explicitly false.
-    // v17.20 restores the v17.13 one-car-at-a-time crusher submit flow.
+    // Gated on: Auto Crusher toggle on, crusherOwned not explicitly false
     if (state.autoCrusher && state.crusherOwned !== false) {
+      // Detect crusher ownership: the button is ALWAYS present on the garage page,
+      // but is rendered with the `disabled` attribute when the player doesn't own a crusher.
+      // We must check both: element exists AND it's not disabled.
       const crusherBtnCheck = document.getElementById('ctl00_main_btnSendtoCrusher');
       const crusherBtnUsable = crusherBtnCheck &&
                                !crusherBtnCheck.disabled &&
                                !crusherBtnCheck.hasAttribute('disabled');
       if (!crusherBtnUsable) {
+        // Button absent OR disabled → definitely no crusher. Permanently disable.
         const reason = !crusherBtnCheck
           ? 'crusher button missing from garage page'
           : 'crusher button present but disabled (no crusher owned)';
@@ -5372,20 +6335,26 @@ let logoutNotificationSent = false;
         if (!crusherPaused) {
           // ONE-AT-A-TIME: find the first eligible damaged crusher car whose model
           // isn't on a gifted cooldown, and send only that one.
+          // STRICT damage > 0: crushing an undamaged car flags script usage, so we
+          // only ever send a car that genuinely shows damage. getGarageRowInfo's
+          // robust row-scan is used ONLY to read name+damage reliably; if the damage
+          // can't be parsed (damageParsed === false) we skip the car entirely.
           let chosenRow = null;
           let chosenName = '';
           for (const row of carRows) {
             const info = getGarageRowInfo(row);
             const carName = info.carName;
+            const damage = info.damage;
+            const damageParsed = info.damageParsed;
             const checkbox = info.checkbox;
             // Skip: missing checkbox/name, manual-only cars, non-crusher cars, OC cars,
-            // models currently on a gifted cooldown. A user-selected Crush category now
-            // means "try crusher" regardless of parsed damage; the previous fixed-column
-            // damage check could wrongly skip selected cars when the table layout changed.
+            // unreadable damage, undamaged cars, models on a gifted cooldown
             if (!checkbox || !carName) continue;
             if (isManualOnlyCar(carName)) continue;
             if (!isCrusherCar(carName)) continue;
             if (isVIPCar(carName)) continue;
+            if (!damageParsed) continue;   // couldn't read damage — never risk it
+            if (damage <= 0) continue;     // strict: only crush genuinely damaged cars
             if (isModelOnGiftedCooldown(carName)) continue;
             chosenRow = row;
             chosenName = carName;
@@ -5395,21 +6364,19 @@ let logoutNotificationSent = false;
           if (chosenRow) {
             // Uncheck EVERYTHING in the entire car table first — not just rows we know
             // about, but the Check All header checkbox and any stray checkboxes too.
-            // UnderCoverLover reported seeing 3 boxes ticked when the script intended 1,
-            // so we belt-and-braces this.
+            // Belt-and-braces against a multi-car submission.
             const allTableCheckboxes = table.querySelectorAll('input[type="checkbox"]');
-            allTableCheckboxes.forEach(cb => setGarageCheckboxChecked(cb, false));
+            allTableCheckboxes.forEach(cb => { cb.checked = false; });
 
             const cb = chosenRow.querySelector('input[type="checkbox"]');
-            if (cb) setGarageCheckboxChecked(cb, true);
+            if (cb) cb.checked = true;
 
             // Verify we have EXACTLY one ticked checkbox before clicking. If the count
             // is wrong, abort and log loudly — this prevents a multi-car submission
             // which would trigger TMN's "you can only crush cars that you stole yourself"
             // error if any of the unintended cars happened to be gifted.
-            const tickedCount = carRows
-              .map(r => r.querySelector('input[type="checkbox"]'))
-              .filter(c => c && c.checked).length;
+            const tickedCount = Array.from(table.querySelectorAll('input[type="checkbox"]'))
+              .filter(c => c.checked).length;
             if (tickedCount !== 1) {
               console.warn(`[TMN] ⚠️ Crusher safety abort — expected exactly 1 ticked checkbox, found ${tickedCount}. Skipping this crush cycle.`);
               updateStatus(`Crusher: aborted (${tickedCount} boxes ticked, expected 1)`);
@@ -5422,9 +6389,9 @@ let logoutNotificationSent = false;
               } catch (e) {
                 console.warn('[TMN] Failed to stash pending crush name:', e);
               }
-              updateStatus(`Sending ${chosenName} to crusher.`);
+              updateStatus(`Sending ${chosenName} to crusher...`);
               console.log(`[TMN] Sending 1 car to crusher: ${chosenName}`);
-              submitAspNetButton(crusherBtnCheck);
+              crusherBtnCheck.click();
               setTimeout(() => {
                 state.isPerformingAction = false;
                 state.currentAction = '';
@@ -5442,11 +6409,6 @@ let logoutNotificationSent = false;
     }
 
     // Step 1b: Sell remaining cars.
-    // What gets sold:
-    //  - Anything that isn't an OC car AND isn't a manual-only car (e.g. Bugatti Chiron SS)
-    //  - Crush-category cars are sold ONLY if Auto Crusher is off, OR the model is on
-    //    a gifted cooldown (meaning a previous crush attempt failed),
-      // Step 1b: Sell remaining cars.
     // Behaviour depends on whether we've confirmed no crusher:
     //  - crusherOwned !== false (own one OR status unknown): keep all listed cars
     //    (OC, Chiron, crusher cars) — only sell unlisted cars like random Nissans.
@@ -5455,9 +6417,6 @@ let logoutNotificationSent = false;
     //    there's no point keeping them. OC cars and Chiron still kept.
     //  - Damaged crusher cars that hit the gifted cooldown are always sold regardless.
     const crusherConfirmedNone = state.crusherOwned === false;
-    // Start sell phase from a clean checkbox state so a manually ticked row or a
-    // previous aborted crusher attempt cannot be sold by accident.
-    table.querySelectorAll('input[type="checkbox"]').forEach(cb => setGarageCheckboxChecked(cb, false));
     let carsToSell = 0;
     carRows.forEach(row => {
       const info = getGarageRowInfo(row);
@@ -5469,21 +6428,22 @@ let logoutNotificationSent = false;
       if (isCrusherCar(carName)) {
         // Gifted cooldown → always sell (we can't crush it right now anyway)
         if (isModelOnGiftedCooldown(carName)) {
-          setGarageCheckboxChecked(checkbox, true);
+          checkbox.checked = true;
           carsToSell++;
           return;
         }
         // No crusher confirmed → sell it, no point hoarding
         if (crusherConfirmedNone) {
-          setGarageCheckboxChecked(checkbox, true);
+          checkbox.checked = true;
           carsToSell++;
           return;
         }
-        // Otherwise keep crusher cars; Step 1a handles the first eligible Crush-category car.
+        // Otherwise keep crusher cars (damaged ones are handled by Step 1a;
+        // undamaged ones are stockpiled for when they eventually take damage)
         return;
       }
       // Unlisted car — sell it
-      setGarageCheckboxChecked(checkbox, true);
+      checkbox.checked = true;
       carsToSell++;
     });
     if (carsToSell > 0) {
@@ -5491,7 +6451,7 @@ let logoutNotificationSent = false;
       if (sellBtn) {
         updateStatus(`Selling ${carsToSell} non-VIP cars...`);
         console.log(`[TMN] Selling ${carsToSell} non-VIP cars`);
-        submitAspNetButton(sellBtn);
+        sellBtn.click();
         setTimeout(() => {
           state.isPerformingAction = false;
           state.currentAction = '';
@@ -5515,9 +6475,9 @@ let logoutNotificationSent = false;
       if (checkbox && isVIPCar(carName) && damage > 0) {
         // Uncheck EVERY checkbox in the table (including Check All header) first
         const allTableCheckboxes = table.querySelectorAll('input[type="checkbox"]');
-        allTableCheckboxes.forEach(cb => setGarageCheckboxChecked(cb, false));
+        allTableCheckboxes.forEach(cb => { cb.checked = false; });
 
-        setGarageCheckboxChecked(checkbox, true);
+        checkbox.checked = true;
 
         // Verify exactly one ticked before clicking — same defence as Step 1a
         const tickedCount = Array.from(table.querySelectorAll('input[type="checkbox"]'))
@@ -5532,7 +6492,7 @@ let logoutNotificationSent = false;
         if (repairBtn) {
           updateStatus(`Repairing VIP car: ${carName} (${damage}% damage)`);
           console.log(`[TMN] Repairing VIP car: ${carName}`);
-          submitAspNetButton(repairBtn);
+          repairBtn.click();
 
           // Reset state and continue automation
           setTimeout(() => {
@@ -5559,12 +6519,424 @@ let logoutNotificationSent = false;
   }
 
   // ---------------------------
+  // Artillery Bunker Auto-Deposit (v17.24)
+  // ---------------------------
+  // Periodically (config.bunkerCheckInterval, default 15 min) checks on-hand
+  // FMJ/JHP (already scraped from the header stats bar) and deposits whatever
+  // is available into the Artillery Bunker on playerproperty.aspx. The
+  // deposit form only accepts one bullet type + amount per submit, so if both
+  // FMJ and JHP are on hand, this drains one type per visit and the next
+  // mainLoop tick immediately picks up the other - the 15-minute timer is
+  // only reset once a check finds nothing left to deposit.
+  function doBunkerSubmit() {
+    if (state.isPerformingAction || state.inJail || automationPaused) return;
+    // v17.31 - autoBunkerExtend is a separate opt-in from autoBunker
+    // (deposits). Either one alone is enough reason to visit the bunker
+    // page on the usual interval - deposits happen if autoBunker is on and
+    // there's something to deposit; the expiry check below happens
+    // regardless, so extension-only setups (autoBunker off) still work.
+    if (!state.autoBunker && !state.autoBunkerExtend) return;
+
+    const now = Date.now();
+    if (now - state.lastBunkerCheck < config.bunkerCheckInterval * 1000) return;
+
+    if (getCurrentPage() !== 'bunker') {
+      updateStatus("Navigating to Artillery Bunker...");
+      safeNavigate('/authenticated/playerproperty.aspx?' + Date.now());
+      return;
+    }
+
+    const bunkerPanel = document.getElementById('ctl00_main_pnlArtilleryBunker');
+    if (!bunkerPanel) {
+      // Bunker panel not present - e.g. it may have expired/blown up, or a
+      // different sub-tab rendered. Don't spin on this every tick.
+      console.log('[TMN][BUNKER] Artillery Bunker panel not found on page');
+      updateStatus("Artillery Bunker not found");
+      state.lastBunkerCheck = now;
+      state.bunkerCheckInProgress = false;
+      GM_setValue('bunkerCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    // BLOCKING-ERROR GATE - same pattern as garage: if there's an unrelated
+    // TMN error on the page (jail, hospital, etc.), don't touch the form.
+    {
+      const errEl = document.getElementById('ctl00_lblMsg');
+      const errTxt = (errEl && errEl.classList.contains('TMNErrorFont')) ? (errEl.textContent || '').trim() : '';
+      if (errTxt) {
+        console.log(`[TMN][BUNKER] Blocking error on page, aborting cycle: "${errTxt.substring(0, 160)}"`);
+        updateStatus(`Bunker blocked: ${errTxt.substring(0, 60)}`);
+        state.lastBunkerCheck = now;
+        state.bunkerCheckInProgress = false;
+        GM_setValue('bunkerCheckStartedAt', 0);
+        saveState();
+        return;
+      }
+    }
+
+    // v17.31 - Auto Extend Bunker: check the expiry label while we're
+    // already here, regardless of what happens with deposits below. Only
+    // ever queues the extension when <=48h are left - this is the hard
+    // gate the whole feature is built around.
+    // v17.42 - always cache the parsed timestamp into state.bunkerExpiresAt
+    // (even when it's not yet due), regardless of the autoBunkerExtend
+    // toggle or whether bunkerExtendPending is already set. This is what
+    // lets the mail-scan trigger in unifiedMailCheck compare a fresh
+    // mail's own timestamp against a KNOWN expiry later, without needing
+    // another page visit in between.
+    if (state.autoBunkerExtend) {
+      const expireEl = document.getElementById('ctl00_main_lblArtBunkExpireDate');
+      const expiresAt = expireEl ? parseBunkerExpireDate(expireEl.textContent) : null;
+      if (expiresAt) {
+        if (expiresAt !== state.bunkerExpiresAt) {
+          state.bunkerExpiresAt = expiresAt;
+          saveState();
+        }
+        if (!state.bunkerExtendPending) {
+          const msRemaining = expiresAt - now;
+          if (msRemaining <= BUNKER_EXT_THRESHOLD_MS) {
+            const hoursLeft = (msRemaining / (1000 * 60 * 60)).toFixed(1);
+            console.log(`[TMN][BUNKER-EXT] ${hoursLeft}h left on bunker (<=48h) - queuing extension`);
+            state.bunkerExtendPending = true;
+            saveState();
+          }
+        }
+      } else if (expireEl) {
+        console.log('[TMN][BUNKER-EXT] Could not parse expiry date text:', expireEl.textContent);
+      }
+    }
+
+    // On-hand bullets come from the header stats bar, present on every page.
+    // Deposits only happen if autoBunker itself is on - an extension-only
+    // setup (autoBunker off, autoBunkerExtend on) should visit this page for
+    // the expiry check above but never touch the deposit form.
+    if (!state.autoBunker) {
+      state.lastBunkerCheck = now;
+      state.bunkerCheckInProgress = false;
+      GM_setValue('bunkerCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    // On-hand bullets come from the header stats bar, present on every page.
+    const fmjEl = document.getElementById('ctl00_userInfo_lblfmj');
+    const jhpEl = document.getElementById('ctl00_userInfo_lbljhp');
+    const fmjOnHand = fmjEl ? (parseInt(fmjEl.textContent.trim(), 10) || 0) : 0;
+    const jhpOnHand = jhpEl ? (parseInt(jhpEl.textContent.trim(), 10) || 0) : 0;
+
+    if (fmjOnHand <= 0 && jhpOnHand <= 0) {
+      updateStatus("Bunker: no FMJ/JHP on hand to deposit");
+      state.lastBunkerCheck = now;
+      state.bunkerCheckInProgress = false;
+      GM_setValue('bunkerCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    const amtInput = document.getElementById('ctl00_main_tbArtBunkAddBullets');
+    const typeSelect = document.getElementById('ctl00_main_ddlArtBunkBulletType');
+    const depositBtn = document.getElementById('ctl00_main_btnArtBunkDeposit');
+    if (!amtInput || !typeSelect || !depositBtn) {
+      console.log('[TMN][BUNKER] Deposit form controls not found');
+      updateStatus("Bunker deposit form not found");
+      state.lastBunkerCheck = now;
+      state.bunkerCheckInProgress = false;
+      GM_setValue('bunkerCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    // Deposit FMJ first if available, else JHP. Whichever type is left (if
+    // any) gets picked up on the very next tick after this postback reloads
+    // the page - lastBunkerCheck is deliberately NOT updated here, only in
+    // the "nothing to deposit" branch above.
+    const depositFMJ = fmjOnHand > 0;
+    const amount = depositFMJ ? fmjOnHand : jhpOnHand;
+
+    // v17.25 fix: don't assume the dropdown's underlying option values (the
+    // previous '1'/'2' guess left JHP unselectable - setting select.value to
+    // a value that doesn't exist on any <option> is a silent no-op, so the
+    // dropdown stayed on FMJ and JHP was never actually submitted). Match by
+    // the option's visible label text instead, which is robust regardless of
+    // what value attribute the page actually uses.
+    const wantedLabel = depositFMJ ? 'fmj' : 'jhp';
+    const matchedOption = Array.from(typeSelect.options || [])
+      .find(o => (o.textContent || o.value || '').trim().toLowerCase().includes(wantedLabel));
+    if (matchedOption) {
+      typeSelect.value = matchedOption.value;
+    } else {
+      // Fallback to the old guess only if we can't find the option by text -
+      // logged so a future mismatch is visible instead of silently failing.
+      console.warn(`[TMN][BUNKER] Could not find "${wantedLabel}" option by text - falling back to guessed value`);
+      typeSelect.value = depositFMJ ? '1' : '2';
+    }
+    try { typeSelect.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+    amtInput.value = String(amount);
+
+    state.isPerformingAction = true;
+    state.currentAction = 'bunker';
+    GM_setValue('actionStartTime', now);
+    saveState();
+
+    console.log(`[TMN][BUNKER] Depositing ${amount} ${depositFMJ ? 'FMJ' : 'JHP'}`);
+    scheduleOCDTMAction(
+      `🔫 Depositing ${amount} ${depositFMJ ? 'FMJ' : 'JHP'} to Artillery Bunker`,
+      () => {
+        depositBtn.click();
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        saveState();
+        updateStatus(`✅ Deposited ${amount} ${depositFMJ ? 'FMJ' : 'JHP'} to bunker`);
+        sendTelegramMessage(
+          '🔫 <b>Bunker Deposit</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Deposited: ${amount} ${depositFMJ ? 'FMJ' : 'JHP'}\n` +
+          (depositFMJ && jhpOnHand > 0 ? 'JHP still on hand - will deposit next cycle' : '✅ Automation resumed')
+        );
+      }
+    );
+  }
+
+  // ---------------------------
+  // Scrapyard Auto-Buy FMJ (v17.28)
+  // ---------------------------
+  // Spends spare scrap (from the crusher) on 1000-FMJ buys at the Scrapyard
+  // (store.aspx?p=s) whenever there's enough scrap for at least one buy.
+  // Same pause pattern as the Artillery Bunker: the check "burst buys" every
+  // tick without waiting for the full interval as long as scrap remains, and
+  // only resets lastScrapyardCheck (falling back to the normal hourly
+  // cadence) once the balance drops below the cost of a single buy.
+  const SCRAPYARD_FMJ_COST = 5; // scrap cost per 1000 FMJ, from the store page label
+  function doScrapyardSubmit() {
+    if (!state.autoScrapyard || state.isPerformingAction || state.inJail || automationPaused) return;
+
+    const now = Date.now();
+
+    if (getCurrentPage() !== 'scrapyard') {
+      updateStatus("Navigating to Scrapyard...");
+      safeNavigate('/authenticated/store.aspx?p=s&' + Date.now());
+      return;
+    }
+
+    const scrapPanel = document.getElementById('ctl00_main_pnlScrapyardContainer');
+    if (!scrapPanel) {
+      console.log('[TMN][SCRAPYARD] Scrapyard panel not found on page');
+      updateStatus("Scrapyard panel not found");
+      state.lastScrapyardCheck = now;
+      state.scrapyardCheckInProgress = false;
+      GM_setValue('scrapyardCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    // BLOCKING-ERROR GATE - same pattern as bunker/garage: if there's an
+    // unrelated TMN error on the page (jail, hospital, etc.), don't touch it.
+    {
+      const errEl = document.getElementById('ctl00_lblMsg');
+      const errTxt = (errEl && errEl.classList.contains('TMNErrorFont')) ? (errEl.textContent || '').trim() : '';
+      if (errTxt) {
+        console.log(`[TMN][SCRAPYARD] Blocking error on page, aborting cycle: "${errTxt.substring(0, 160)}"`);
+        updateStatus(`Scrapyard blocked: ${errTxt.substring(0, 60)}`);
+        state.lastScrapyardCheck = now;
+        state.scrapyardCheckInProgress = false;
+        GM_setValue('scrapyardCheckStartedAt', 0);
+        saveState();
+        return;
+      }
+    }
+
+    const balEl = document.getElementById('ctl00_main_lblScrapBalance');
+    const scrapBalance = balEl ? (parseFloat((balEl.textContent || '').trim().replace(/,/g, '')) || 0) : 0;
+
+    if (scrapBalance < SCRAPYARD_FMJ_COST) {
+      // Nothing left to spend on FMJ this round - this is the ONLY branch
+      // that resets lastScrapyardCheck, which is what lets the loop fall
+      // back to the normal hourly cadence instead of hammering the page.
+      updateStatus(`Scrapyard: ${scrapBalance.toFixed(2)} scrap left, not enough for FMJ (needs ${SCRAPYARD_FMJ_COST})`);
+      state.lastScrapyardCheck = now;
+      state.scrapyardCheckInProgress = false;
+      GM_setValue('scrapyardCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    const buyLink = document.getElementById('ctl00_main_lbBuy1kFMJScrap');
+    if (!buyLink) {
+      console.log('[TMN][SCRAPYARD] Buy FMJ link not found');
+      updateStatus("Scrapyard: Buy FMJ link not found");
+      state.lastScrapyardCheck = now;
+      state.scrapyardCheckInProgress = false;
+      GM_setValue('scrapyardCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    // Deliberately NOT updating lastScrapyardCheck here - scrapyardCheckInProgress
+    // stays true so the very next tick (after this postback reloads the page)
+    // immediately buys again if scrap remains, draining the balance in a burst
+    // rather than waiting a full interval between each 1000 FMJ buy.
+    state.isPerformingAction = true;
+    state.currentAction = 'scrapyard';
+    GM_setValue('actionStartTime', now);
+    saveState();
+
+    console.log(`[TMN][SCRAPYARD] Buying 1000 FMJ for ${SCRAPYARD_FMJ_COST} scrap (balance: ${scrapBalance})`);
+    scheduleOCDTMAction(
+      `⚙️ Buying 1000 FMJ from Scrapyard (${scrapBalance.toFixed(2)} scrap on hand)`,
+      () => {
+        buyLink.click();
+        state.isPerformingAction = false;
+        state.currentAction = '';
+        GM_setValue('actionStartTime', 0);
+        saveState();
+        updateStatus(`✅ Bought 1000 FMJ from Scrapyard`);
+        sendTelegramMessage(
+          '⚙️ <b>Scrapyard Purchase</b>\n\n' +
+          `Player: ${state.playerName || 'Unknown'}\n` +
+          `Bought: 1000 FMJ (${SCRAPYARD_FMJ_COST} scrap)\n` +
+          `Scrap remaining: ~${(scrapBalance - SCRAPYARD_FMJ_COST).toFixed(2)}`
+        );
+      }
+    );
+  }
+
+  // Hoisted to module scope (v17.45) so both mainLoop's gating and
+  // checkHotCitySafetyNet below can reference the same constant.
+  const TRAVEL_BACK_DELAY_MS = 22 * 60 * 1000;
+
+  // ---------------------------
+  // Hot City Safety Net (v17.45)
+  // ---------------------------
+  // A backstop independent of the four DTM-completion triggers: every
+  // config.hotCitySafetyCheckInterval (default 30 min), re-verify we're
+  // actually sitting in the hot city, in case all four triggers were missed
+  // for some reason (manual travel elsewhere, a trigger silently failing,
+  // etc). Deliberately reuses the exact same pendingTravelBack /
+  // travelBackQueuedAt / doTravelBackToHotCity machinery as the DTM
+  // triggers rather than duplicating the hot-city-comparison or travel-
+  // click logic: this only ever sets travelBackQueuedAt to a value that's
+  // ALREADY past the 22-minute wait, so mainLoop's existing gate is
+  // satisfied on the very next tick and goes straight into
+  // navigate-and-check. If it turns out we're already in the hot city,
+  // doTravelBackToHotCity() itself clears pendingTravelBack right back off
+  // silently - no travel, no wasted jet cooldown. If not, it travels
+  // immediately via the same private jet button as always.
+  function checkHotCitySafetyNet(now) {
+    if (!state.autoTravelAfterDTM) return;
+    // Something's already queued or actively running (from a DTM trigger,
+    // or a previous safety-net check) - don't stomp it, just wait our turn.
+    if (state.pendingTravelBack || state.travelBackInProgress) return;
+    if (now - state.lastHotCitySafetyCheck < config.hotCitySafetyCheckInterval * 1000) return;
+
+    state.lastHotCitySafetyCheck = now;
+    state.pendingTravelBack = true;
+    // Already "expired" relative to TRAVEL_BACK_DELAY_MS, so the mainLoop
+    // gate treats this as immediately due instead of waiting 22 more minutes.
+    state.travelBackQueuedAt = now - TRAVEL_BACK_DELAY_MS - 1000;
+    saveState();
+    console.log('[TMN][TRAVEL-BACK] Hot city safety net check due - verifying current city now');
+  }
+
+  // ---------------------------
+  // Travel Back to Hot City after DTM (v17.29, updated v17.32)
+  // ---------------------------
+  // Triggered by state.pendingTravelBack (set true when a DTM completes, see
+  // the scheduleOCDTMAction callback in the DTM completion flow). Waits a
+  // fixed 22 minutes from state.travelBackQueuedAt (was: the real travel
+  // cooldown via getTravelTimerStatus()) - the wait is gated in mainLoop,
+  // not in here - then travels to whichever city is marked hot directly on
+  // the live travel.aspx page (the site itself wraps the hot city's
+  // radio/label in <span class="hot">) using the "Travel (Private jet*)"
+  // button specifically - never the normal travel button.
+  function doTravelBackToHotCity() {
+    if (!state.autoTravelAfterDTM || !state.pendingTravelBack) {
+      // Nothing queued, or the feature got turned off mid-flight - bail out
+      // and let the caller clear travelBackInProgress.
+      return;
+    }
+    if (state.isPerformingAction || state.inJail || automationPaused) return;
+
+    if (getCurrentPage() !== 'travel') {
+      updateStatus("Navigating to Airport to travel back to hot city...");
+      safeNavigate('/authenticated/travel.aspx?' + Date.now());
+      return;
+    }
+
+    const currentCityEl = document.getElementById('ctl00_userInfo_lblcity');
+    const currentCity = currentCityEl ? currentCityEl.textContent.trim() : '';
+
+    const hotCitySpan = document.querySelector('#ctl00_main_citieslist .hot');
+    if (!hotCitySpan) {
+      console.log('[TMN][TRAVEL-BACK] No hot city marked on travel page - clearing pending travel');
+      state.pendingTravelBack = false;
+      state.travelBackInProgress = false;
+      state.travelBackQueuedAt = 0;
+      GM_setValue('travelBackStartedAt', 0);
+      saveState();
+      updateStatus("Travel back: no hot city found on page - skipped");
+      return;
+    }
+
+    const hotCityRadio = hotCitySpan.querySelector('input[type="radio"]');
+    const hotCityLabelEl = hotCitySpan.querySelector('label');
+    // Label text looks like "Toronto - Canada - $28,095 / $112,380" - just the
+    // city name (first segment) is what we want for matching/display.
+    const hotCityName = hotCityLabelEl ? (hotCityLabelEl.textContent.split(' - ')[0] || '').trim() : 'hot city';
+
+    // Already in the hot city - nothing to travel for.
+    if (currentCity && hotCityName && currentCity.toLowerCase() === hotCityName.toLowerCase()) {
+      console.log(`[TMN][TRAVEL-BACK] Already in hot city (${currentCity}) - clearing pending travel`);
+      state.pendingTravelBack = false;
+      state.travelBackInProgress = false;
+      state.travelBackQueuedAt = 0;
+      GM_setValue('travelBackStartedAt', 0);
+      saveState();
+      updateStatus(`Already in hot city (${currentCity}) - travel skipped`);
+      return;
+    }
+
+    const travelPrivateBtn = document.getElementById('ctl00_main_btnTravelPrivate');
+    if (!hotCityRadio || !travelPrivateBtn) {
+      console.warn('[TMN][TRAVEL-BACK] Hot city radio or Travel (Private jet) button not found - will retry next tick');
+      return;
+    }
+
+    state.isPerformingAction = true;
+    state.currentAction = 'travelBack';
+    GM_setValue('actionStartTime', Date.now());
+    saveState();
+
+    console.log(`[TMN][TRAVEL-BACK] Traveling (private jet) to hot city: ${hotCityName}`);
+    scheduleOCDTMAction(`🛫 Traveling to hot city via jet (${hotCityName})`, () => {
+      hotCityRadio.checked = true;
+      travelPrivateBtn.click();
+      state.pendingTravelBack = false;
+      state.travelBackInProgress = false;
+      state.travelBackQueuedAt = 0;
+      state.isPerformingAction = false;
+      state.currentAction = '';
+      GM_setValue('actionStartTime', 0);
+      GM_setValue('travelBackStartedAt', 0);
+      saveState();
+      updateStatus(`✅ Traveling to hot city (${hotCityName}) via jet`);
+      sendTelegramMessage(
+        '🛫 <b>Traveling to Hot City</b>\n\n' +
+        `Player: ${state.playerName || 'Unknown'}\n` +
+        `Destination: ${hotCityName}\n` +
+        'Private jet travel initiated (22 min after DTM completion)'
+      );
+    });
+  }
+
+  // ---------------------------
   // Hot City System
   // ---------------------------
   // The "hot city" is the city with the OC bonus, rotating daily at CET midnight.
   // Scraped from the statistics page, cached in localStorage until next midnight.
-  const LS_HOT_CITY = 'tmnOCDTMHotCity';
-  const LS_HOT_CITY_UNTIL = 'tmnOCDTMHotCityUntil';
+  const LS_HOT_CITY         = 'tmnOCDTMHotCity';
+  const LS_HOT_CITY_UNTIL   = 'tmnOCDTMHotCityUntil';
   const LS_HOT_CITY_PENDING = 'tmnHotCityPending';
 
   function getMidnightCETTimestamp() {
@@ -5582,7 +6954,7 @@ let logoutNotificationSent = false;
   function scrapeHotCityFromDOM(doc) {
     if (!doc) return null;
     try {
-      // The statistics page uses mat-inline-symbol spans with #990000 color for each city.
+      // The statistics page uses mat-inline-symbol spans with #990000 colour for each city.
       // The HOT city is identified by the icon text "Swords" (Material icon name) in the
       // #990000 span. The city name is in the next sibling span element.
       // Structure: <span class="mat-inline-symbol" style="...#990000...">Swords</span>
@@ -5592,7 +6964,7 @@ let logoutNotificationSent = false;
       // Alternative approach: look for any text node containing "Hot city" and work
       // backwards to find the city name. This is more resilient to layout changes.
 
-      // Approach 1: Find "Swords" icon span → next sibling is the city name
+      // Approach 1: Find "Swords" icon span -> next sibling is the city name
       for (const span of doc.querySelectorAll('span.mat-inline-symbol')) {
         const style = span.getAttribute('style') || '';
         if (!/990000/.test(style)) continue;
@@ -5609,12 +6981,12 @@ let logoutNotificationSent = false;
         }
       }
 
-      // Approach 2: Fallback — search for "Hot city" text in any element
+      // Approach 2: Fallback - search for "Hot city" text in any element
       const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, null, false);
       while (walker.nextNode()) {
         const text = walker.currentNode.textContent;
         if (/hot\s*city/i.test(text)) {
-          // Walk up to find a city name — usually in a nearby span
+          // Walk up to find a city name - usually in a nearby span
           const parent = walker.currentNode.parentElement;
           if (parent) {
             const prev = parent.previousElementSibling;
@@ -5639,7 +7011,7 @@ let logoutNotificationSent = false;
   function saveHotCity(city) {
     localStorage.setItem(LS_HOT_CITY, city);
     localStorage.setItem(LS_HOT_CITY_UNTIL, String(getMidnightCETTimestamp()));
-    console.log(`[TMN][HotCity] Hot city set: "${city}" — cache valid until CET midnight`);
+    console.log(`[TMN][HotCity] Hot city set: "${city}" - cache valid until CET midnight`);
   }
 
   function getHotCity() {
@@ -5654,7 +7026,7 @@ let logoutNotificationSent = false;
 
   function isInHotCity() {
     const hotCity = getHotCity();
-    if (!hotCity) return false; // No cached city → don't allow (need to scrape first)
+    if (!hotCity) return false; // No cached city -> don't allow (need to scrape first)
     try {
       const el = document.getElementById('ctl00_userInfo_lblcity');
       const currentCity = (el ? el.textContent : '').trim();
@@ -5680,7 +7052,7 @@ let logoutNotificationSent = false;
           saveHotCity(city);
           if (localStorage.getItem(LS_HOT_CITY_PENDING) === '1') {
             localStorage.removeItem(LS_HOT_CITY_PENDING);
-            console.log('[TMN][HotCity] Hot city captured — returning to crimes page');
+            console.log('[TMN][HotCity] Hot city captured - returning to crimes page');
             window.location.href = '/authenticated/crimes.aspx?' + Date.now();
           }
         } else {
@@ -5701,13 +7073,13 @@ let logoutNotificationSent = false;
   // ---------------------------
   // OC Team Creation (Leader Mode)
   // ---------------------------
-  // State machine: idle → setup (steps 0-4) → polling (waiting for commit)
+  // State machine: idle -> setup (steps 0-4) -> polling (waiting for commit)
   // Steps: 0=Start OC, 1=Invite Transporter, 2=Invite Weapon Master,
   //        3=Invite Explosive Expert, 4=Buy Laptop, 5=Polling for Commit
-  const LS_CREATE_OC_STATE = 'tmnCreateOCState';        // idle | setup | polling
-  const LS_CREATE_OC_STEP = 'tmnCreateOCStep';          // 0-5
-  const LS_CREATE_OC_NEXT_CHECK = 'tmnCreateOCNextCheckAt'; // ms timestamp
-  const LS_CREATE_OC_RETRY_AFTER = 'tmnCreateOCRetryAfter'; // ms timestamp
+  const LS_CREATE_OC_STATE        = 'tmnCreateOCState';        // idle | setup | polling
+  const LS_CREATE_OC_STEP         = 'tmnCreateOCStep';         // 0-5
+  const LS_CREATE_OC_NEXT_CHECK   = 'tmnCreateOCNextCheckAt';  // ms timestamp
+  const LS_CREATE_OC_RETRY_AFTER  = 'tmnCreateOCRetryAfter';   // ms timestamp
   const LS_CREATE_OC_POLLING_SINCE = 'tmnCreateOCPollingSince'; // ms timestamp
 
   function getCreateOCState() {
@@ -5727,7 +7099,7 @@ let logoutNotificationSent = false;
 
   // Parse a scheduled time from an HTML datetime-local input.
   // Format: "YYYY-MM-DDTHH:MM" (native browser format).
-  // Returns 0 if empty/invalid (meaning no schedule — trigger on cooldown only).
+  // Returns 0 if empty/invalid (meaning no schedule - trigger on cooldown only).
   function parseScheduledTime(str) {
     if (!str || !str.trim()) return 0;
     const d = new Date(str.trim());
@@ -5736,7 +7108,7 @@ let logoutNotificationSent = false;
 
   function isOCScheduleReady() {
     const scheduledMs = parseScheduledTime(state.ocScheduledTime);
-    if (scheduledMs === 0) return true; // No schedule set — always ready (trigger on cooldown)
+    if (scheduledMs === 0) return true; // No schedule set - always ready (trigger on cooldown)
     return Date.now() >= scheduledMs;
   }
 
@@ -5744,24 +7116,24 @@ let logoutNotificationSent = false;
   function triggerCreateOC() {
     if (!state.createOC) return;
 
-    // Check scheduled time — both schedule AND cooldown must be ready
+    // Check scheduled time - both schedule AND cooldown must be ready
     if (!isOCScheduleReady()) {
       const scheduledMs = parseScheduledTime(state.ocScheduledTime);
       const minsLeft = Math.ceil((scheduledMs - Date.now()) / 60000);
-      console.log(`[TMN][CreateOC] OC cooldown ready but scheduled time not reached — ${minsLeft} min remaining`);
+      console.log(`[TMN][CreateOC] OC cooldown ready but scheduled time not reached - ${minsLeft} min remaining`);
       return;
     }
 
     // Check retry cooldown
     const retryAfter = parseInt(localStorage.getItem(LS_CREATE_OC_RETRY_AFTER) || '0', 10);
     if (retryAfter && Date.now() < retryAfter) {
-      console.log(`[TMN][CreateOC] Retry suppressed — ${Math.ceil((retryAfter - Date.now()) / 1000)}s remaining`);
+      console.log(`[TMN][CreateOC] Retry suppressed - ${Math.ceil((retryAfter - Date.now()) / 1000)}s remaining`);
       return;
     }
 
     // Ensure we know the hot city
     if (!getHotCity()) {
-      console.log('[TMN][CreateOC] Hot city not cached — fetching before proceeding');
+      console.log('[TMN][CreateOC] Hot city not cached - fetching before proceeding');
       fetchHotCity();
       return;
     }
@@ -5770,7 +7142,7 @@ let logoutNotificationSent = false;
     if (!isInHotCity()) {
       const hotCity = getHotCity() || '?';
       const currentCity = getCurrentCity();
-      console.log(`[TMN][CreateOC] Not in hot city — current="${currentCity}" hot="${hotCity}" — skipping`);
+      console.log(`[TMN][CreateOC] Not in hot city - current="${currentCity}" hot="${hotCity}" - skipping`);
       sendTelegramMessage(
         '⚠️ <b>OC Not Started</b>\n\n' +
         `Player: ${state.playerName || 'Unknown'}\n` +
@@ -5784,16 +7156,16 @@ let logoutNotificationSent = false;
     const w = state.ocTeamWeaponMaster.trim();
     const e = state.ocTeamExplosive.trim();
     if (!t || !w || !e) {
-      console.log(`[TMN][CreateOC] Team not fully configured — T="${t}" W="${w}" E="${e}"`);
+      console.log(`[TMN][CreateOC] Team not fully configured - T="${t}" W="${w}" E="${e}"`);
       sendTelegramMessage(
         '⚠️ <b>OC Ready But Team Not Set</b>\n\n' +
         `Player: ${state.playerName || 'Unknown'}\n` +
-        'Set team members in Settings → OC Team before creating'
+        'Set team members in Settings -> OC Team before creating'
       );
       return;
     }
 
-    console.log('[TMN][CreateOC] OC is ready — initiating setup');
+    console.log('[TMN][CreateOC] OC is ready - initiating setup');
     sendTelegramMessage(
       '🏢 <b>OC Team Setup Starting</b>\n\n' +
       `Leader: ${state.playerName || 'Unknown'}\n` +
@@ -5808,15 +7180,13 @@ let logoutNotificationSent = false;
     const onOCPage = /\/authenticated\/organizedcrime\.aspx/i.test(location.pathname) &&
                      !/p=dtm/i.test(location.search);
     if (onOCPage) {
-      scheduleOCDTMAction('Opening OC creation handler', () => handleCreateOCPage());
+      setTimeout(() => handleCreateOCPage(), 600);
     } else {
-      scheduleOCDTMAction('Opening OC creation page', () => {
-        window.location.href = OC_URL + '?' + Date.now();
-      });
+      window.location.href = OC_URL + '?' + Date.now();
     }
   }
 
-  // Main OC creation handler — closely based on the proven working flow from
+  // Main OC creation handler - closely based on the proven working flow from
   // the reference script. Uses form.submit() with hidden inputs for ASP.NET
   // postback reliability instead of .click() which can be intercepted by confirm dialogs.
   async function handleCreateOCPage() {
@@ -5833,11 +7203,11 @@ let logoutNotificationSent = false;
     const nextCheck = parseInt(localStorage.getItem(LS_CREATE_OC_NEXT_CHECK) || '0', 10);
     if (nextCheck > Date.now()) return false;
 
-    const step = getCreateOCStep();
-    const transporter = state.ocTeamTransporter.trim();
-    const weaponMaster = state.ocTeamWeaponMaster.trim();
-    const explosiveExpert = state.ocTeamExplosive.trim();
-    const username = state.playerName || 'Unknown';
+    const step             = getCreateOCStep();
+    const transporter      = state.ocTeamTransporter.trim();
+    const weaponMaster     = state.ocTeamWeaponMaster.trim();
+    const explosiveExpert  = state.ocTeamExplosive.trim();
+    const username         = state.playerName || 'Unknown';
 
     // Helper: submit a button via form.submit() with a hidden input (reliable ASP.NET postback)
     function formSubmitButton(btn) {
@@ -5867,8 +7237,8 @@ let logoutNotificationSent = false;
       if (ocState === 'polling') {
         const commitBtn = document.getElementById('ctl00_main_btnCommitOC');
         if (commitBtn && !commitBtn.disabled) {
-          console.log('[TMN][CreateOC] Polling: Commit button ready — submitting!');
-          await waitOCDTMActionDelay('OC/DTM action');
+          console.log('[TMN][CreateOC] Polling: Commit button ready - submitting!');
+          await sleepMs(randomDelay(DELAYS.normal));
           formSubmitButton(commitBtn);
 
           // Determine whether to continue or stop based on repeat mode
@@ -5878,20 +7248,20 @@ let logoutNotificationSent = false;
 
           if (mode === 'continuous') {
             willRepeat = true;
-            statusMsg = 'Cooldown started — will create again when ready (continuous)';
+            statusMsg = 'Cooldown started - will create again when ready (continuous)';
           } else if (mode === 'once') {
             willRepeat = false;
-            statusMsg = 'Cooldown started — one-off complete, Create OC disabled';
+            statusMsg = 'Cooldown started - one-off complete, Create OC disabled';
           } else {
             // repeat_1, repeat_2, repeat_3
             const left = (state.ocRepeatsLeft || 0) - 1;
             if (left > 0) {
               state.ocRepeatsLeft = left;
               willRepeat = true;
-              statusMsg = `Cooldown started — ${left} repeat(s) remaining`;
+              statusMsg = `Cooldown started - ${left} repeat(s) remaining`;
             } else {
               willRepeat = false;
-              statusMsg = 'Cooldown started — all repeats done, Create OC disabled';
+              statusMsg = 'Cooldown started - all repeats done, Create OC disabled';
             }
           }
 
@@ -5904,7 +7274,7 @@ let logoutNotificationSent = false;
           resetCreateOC();
 
           if (!willRepeat) {
-            // Turn off Create OC — one-off or all repeats used
+            // Turn off Create OC - one-off or all repeats used
             state.createOC = false;
             state.ocScheduledTime = '';
             state.ocRepeatsLeft = 0;
@@ -5917,15 +7287,15 @@ let logoutNotificationSent = false;
                 if (cb) cb.checked = false;
               }
             } catch (e) {}
-            console.log('[TMN][CreateOC] Create OC disabled — schedule complete');
+            console.log('[TMN][CreateOC] Create OC disabled - schedule complete');
           } else {
             saveState();
-            console.log(`[TMN][CreateOC] Will repeat — mode=${mode}, repeatsLeft=${state.ocRepeatsLeft}`);
+            console.log(`[TMN][CreateOC] Will repeat - mode=${mode}, repeatsLeft=${state.ocRepeatsLeft}`);
           }
           return true;
         }
-        // Not ready yet — check back in 60s
-        console.log('[TMN][CreateOC] Polling: Commit not ready — rechecking in 60s');
+        // Not ready yet - check back in 60s
+        console.log('[TMN][CreateOC] Polling: Commit not ready - rechecking in 60s');
         localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 60000));
         // Navigate away so normal automation can continue
         window.location.href = '/authenticated/crimes.aspx?' + Date.now();
@@ -5946,12 +7316,12 @@ let logoutNotificationSent = false;
         const hasBuyBtn = !!document.getElementById('ctl00_main_btnBuySecurity');
 
         if (!hasInviteForm && !hasCommitBtn && !hasBuyBtn && hasStartBtn) {
-          // Start buttons are showing again → OC was cancelled/dismissed
-          console.log('[TMN][CreateOC] OC appears to have been cancelled externally — resetting');
+          // Start buttons are showing again -> OC was cancelled/dismissed
+          console.log('[TMN][CreateOC] OC appears to have been cancelled externally - resetting');
           sendTelegramMessage(
             '⚠️ <b>OC Cancelled (External)</b>\n\n' +
             `Player: ${username}\n` +
-            'OC was dismissed in-game — resetting Create OC state'
+            'OC was dismissed in-game - resetting Create OC state'
           );
           resetCreateOC();
           return false;
@@ -5960,9 +7330,9 @@ let logoutNotificationSent = false;
 
       // STEP 0: Click start button based on user's OC type preference
       if (step === 0) {
-        const casinoBtn = document.getElementById('ctl00_main_btnStartOCRobCasino');
+        const casinoBtn  = document.getElementById('ctl00_main_btnStartOCRobCasino');
         const armouryBtn = document.getElementById('ctl00_main_btnStartOCRobArmoury');
-        const bankBtn = document.getElementById('ctl00_main_btnStartOCRobBank');
+        const bankBtn    = document.getElementById('ctl00_main_btnStartOCRobBank');
 
         // Build preference order based on user's selection
         let preferred;
@@ -5977,14 +7347,14 @@ let logoutNotificationSent = false;
 
         const startBtn = preferred.find(btn => btn && !btn.disabled) || null;
         if (!startBtn) {
-          console.log('[TMN][CreateOC] No enabled start button found — retrying in 5s');
+          console.log('[TMN][CreateOC] No enabled start button found - retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return false;
         }
         const typeName = startBtn.id.includes('Casino') ? 'Casino'
                        : startBtn.id.includes('Armoury') ? 'Armoury' : 'Bank';
-        console.log(`[TMN][CreateOC] Step 0: Starting OC — ${typeName}`);
-        await waitOCDTMActionDelay('OC/DTM action');
+        console.log(`[TMN][CreateOC] Step 0: Starting OC - ${typeName}`);
+        await sleepMs(randomDelay(DELAYS.normal));
         sendTelegramMessage(
           `🏢 <b>OC Step 1/5</b>\n\nLeader: ${username}\n` +
           `Started OC (${typeName})`
@@ -5999,29 +7369,29 @@ let logoutNotificationSent = false;
       // STEP 1: Invite Transporter
       if (step === 1) {
         if (!transporter) { console.log('[TMN][CreateOC] Transporter not set'); resetCreateOC(); return false; }
-        const nameInput = document.getElementById('ctl00_main_txtinvitename');
+        const nameInput  = document.getElementById('ctl00_main_txtinvitename');
         const roleSelect = document.getElementById('ctl00_main_roleslist');
-        const inviteBtn = document.getElementById('ctl00_main_btninvite');
+        const inviteBtn  = document.getElementById('ctl00_main_btninvite');
         if (!nameInput || !roleSelect || !inviteBtn) {
-          console.log('[TMN][CreateOC] Step 1: Invite form not found — retrying in 5s');
+          console.log('[TMN][CreateOC] Step 1: Invite form not found - retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return true;
         }
         console.log('[TMN][CreateOC] Step 1: Clearing field');
         nameInput.value = '';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 1: Enter ' + transporter);
         nameInput.value = transporter;
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 1: Select Transporter');
         roleSelect.value = 'Transporter';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 1: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 2/5</b>\n\nLeader: ${username}\n` +
           `Invited ${transporter} as Transporter`
         );
-        // Advance step BEFORE click — postback reloads page immediately
+        // Advance step BEFORE click - postback reloads page immediately
         localStorage.setItem(LS_CREATE_OC_STEP, '2');
         localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 10000));
         inviteBtn.click();
@@ -6031,23 +7401,23 @@ let logoutNotificationSent = false;
       // STEP 2: Invite Weapon Master
       if (step === 2) {
         if (!weaponMaster) { console.log('[TMN][CreateOC] Weapon Master not set'); resetCreateOC(); return false; }
-        const nameInput = document.getElementById('ctl00_main_txtinvitename');
+        const nameInput  = document.getElementById('ctl00_main_txtinvitename');
         const roleSelect = document.getElementById('ctl00_main_roleslist');
-        const inviteBtn = document.getElementById('ctl00_main_btninvite');
+        const inviteBtn  = document.getElementById('ctl00_main_btninvite');
         if (!nameInput || !roleSelect || !inviteBtn) {
-          console.log('[TMN][CreateOC] Step 2: Invite form not found — retrying in 5s');
+          console.log('[TMN][CreateOC] Step 2: Invite form not found - retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return true;
         }
         console.log('[TMN][CreateOC] Step 2: Clearing field');
         nameInput.value = '';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 2: Enter ' + weaponMaster);
         nameInput.value = weaponMaster;
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 2: Select WeaponMaster');
         roleSelect.value = 'WeaponMaster';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 2: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 3/5</b>\n\nLeader: ${username}\n` +
@@ -6062,23 +7432,23 @@ let logoutNotificationSent = false;
       // STEP 3: Invite Explosive Expert
       if (step === 3) {
         if (!explosiveExpert) { console.log('[TMN][CreateOC] Explosive Expert not set'); resetCreateOC(); return false; }
-        const nameInput = document.getElementById('ctl00_main_txtinvitename');
+        const nameInput  = document.getElementById('ctl00_main_txtinvitename');
         const roleSelect = document.getElementById('ctl00_main_roleslist');
-        const inviteBtn = document.getElementById('ctl00_main_btninvite');
+        const inviteBtn  = document.getElementById('ctl00_main_btninvite');
         if (!nameInput || !roleSelect || !inviteBtn) {
-          console.log('[TMN][CreateOC] Step 3: Invite form not found — retrying in 5s');
+          console.log('[TMN][CreateOC] Step 3: Invite form not found - retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return true;
         }
         console.log('[TMN][CreateOC] Step 3: Clearing field');
         nameInput.value = '';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 3: Enter ' + explosiveExpert);
         nameInput.value = explosiveExpert;
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 3: Select ExplosiveExpert');
         roleSelect.value = 'ExplosiveExpert';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
         console.log('[TMN][CreateOC] Step 3: Click invite');
         sendTelegramMessage(
           `🏢 <b>OC Step 4/5</b>\n\nLeader: ${username}\n` +
@@ -6093,44 +7463,44 @@ let logoutNotificationSent = false;
       // STEP 4: Buy Laptop (security device)
       if (step === 4) {
         console.log('[TMN][CreateOC] Step 4: Verifying team is still intact...');
-        const commanderEl = document.querySelector('#ctl00_main_lblcommanderstatus');
+        const commanderEl   = document.querySelector('#ctl00_main_lblcommanderstatus');
         const transporterEl = document.querySelector('#ctl00_main_lbltransporterstatus');
-        const explosiveEl = document.querySelector('#ctl00_main_lblexplosiveexpertstatus');
+        const explosiveEl   = document.querySelector('#ctl00_main_lblexplosiveexpertstatus');
 
-        const commanderStatus = commanderEl ? commanderEl.textContent.trim().toLowerCase() : '';
+        const commanderStatus   = commanderEl   ? commanderEl.textContent.trim().toLowerCase()   : '';
         const transporterStatus = transporterEl ? transporterEl.textContent.trim().toLowerCase() : '';
-        const explosiveStatus = explosiveEl ? explosiveEl.textContent.trim().toLowerCase() : '';
+        const explosiveStatus   = explosiveEl   ? explosiveEl.textContent.trim().toLowerCase()   : '';
 
-        console.log(`[TMN][CreateOC] Step 4: Team status — Commander: ${commanderStatus}, Transporter: ${transporterStatus}, Explosive: ${explosiveStatus}`);
+        console.log(`[TMN][CreateOC] Step 4: Team status - Commander: ${commanderStatus}, Transporter: ${transporterStatus}, Explosive: ${explosiveStatus}`);
 
         if (commanderStatus.includes('open') || transporterStatus.includes('open') || explosiveStatus.includes('open')) {
-          console.log('[TMN][CreateOC] Step 4: Team incomplete — cancelling');
+          console.log('[TMN][CreateOC] Step 4: Team incomplete - cancelling');
           sendTelegramMessage(
             '⚠️ <b>OC Cancelled</b>\n\n' +
             `Leader: ${username}\n` +
-            'Team incomplete — someone left or declined'
+            'Team incomplete - someone left or declined'
           );
           resetCreateOC();
           return false;
         }
 
         const secSelect = document.getElementById('ctl00_main_securitydeviceslist');
-        const buyBtn = document.getElementById('ctl00_main_btnBuySecurity');
+        const buyBtn    = document.getElementById('ctl00_main_btnBuySecurity');
 
         if (!secSelect || !buyBtn) {
-          console.log('[TMN][CreateOC] Step 4: Buy form not found — retrying in 5s');
+          console.log('[TMN][CreateOC] Step 4: Buy form not found - retrying in 5s');
           localStorage.setItem(LS_CREATE_OC_NEXT_CHECK, String(Date.now() + 5000));
           return true;
         }
 
         console.log('[TMN][CreateOC] Step 4: Select Laptop');
         secSelect.value = '6';
-        await waitOCDTMActionDelay('OC/DTM action');
+        await sleepMs(randomDelay(DELAYS.normal));
 
         console.log('[TMN][CreateOC] Step 4: Click Buy');
         sendTelegramMessage(
           `🏢 <b>OC Step 5/5</b>\n\nLeader: ${username}\n` +
-          'Bought laptop — waiting for team to commit'
+          'Bought laptop - waiting for team to commit'
         );
         localStorage.setItem(LS_CREATE_OC_STEP, '5');
         localStorage.setItem(LS_CREATE_OC_STATE, 'polling');
@@ -6148,8 +7518,10 @@ let logoutNotificationSent = false;
     return false;
   }
 
-  // Millisecond sleep helper for OC creation. Kept separate so it does not
-  // overwrite the main humanDelay(range) helper used by action timing.
+  // ---------------------------
+  // Millisecond sleep helper for OC creation. Kept separate (renamed from the old
+  // duplicate humanDelay(ms)) so it never shadows the early humanDelay(range) helper.
+  // ---------------------------
   function sleepMs(ms) {
     return new Promise(resolve => setTimeout(resolve, typeof ms === 'number' ? ms : 1000));
   }
@@ -6229,9 +7601,9 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.20</strong>
+          <strong>TMN TDS Auto v17.46</strong>
           <div>
-            <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
+            <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
               <i class="bi bi-gear"></i>
             </button>
@@ -6258,36 +7630,48 @@ let logoutNotificationSent = false;
                 <label class="form-check-label" for="tmn-auto-health">Auto Health</label>
               </div>
               <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="tmn-auto-booze">
-                <label class="form-check-label" for="tmn-auto-booze">Auto Booze</label>
-              </div>
-              <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="tmn-auto-dtm">
-                <label class="form-check-label" for="tmn-auto-dtm">🚚 Auto DTM</label>
-              </div>
-              <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-auto-jail">
                 <label class="form-check-label" for="tmn-auto-jail">Auto Jail</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-booze">
+                <label class="form-check-label" for="tmn-auto-booze">Auto Booze</label>
               </div>
               <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-auto-oc">
                 <label class="form-check-label" for="tmn-auto-oc">🕵️ Auto OC</label>
               </div>
               <div class="form-check form-switch">
-                <input class="form-check-input" type="checkbox" id="tmn-create-oc">
-                <label class="form-check-label" for="tmn-create-oc" id="tmn-create-oc-label" style="cursor:pointer; text-decoration:underline; color:#60a5fa;">🏢 Create OC</label>
+                <input class="form-check-input" type="checkbox" id="tmn-auto-dtm">
+                <label class="form-check-label" for="tmn-auto-dtm">🚚 Auto DTM</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-travel-back">
+                <label class="form-check-label" for="tmn-auto-travel-back" title="After a DTM completes, waits 22 minutes then travels back (private jet) to whichever city is currently hot. Also runs an independent safety-net check (see Settings) that verifies you're actually in the hot city every so often and travels back immediately if not.">🛫 Auto Travel</label>
               </div>
               <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-auto-garage">
                 <label class="form-check-label" for="tmn-auto-garage">Auto Garage</label>
               </div>
-              <div class="form-check form-switch" style="grid-column: 2;">
-                <input class="form-check-input" type="checkbox" id="tmn-notify-ocdtm-ready">
-                <label class="form-check-label" for="tmn-notify-ocdtm-ready">🔔 OC/DTM Alerts</label>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-bunker">
+                <label class="form-check-label" for="tmn-auto-bunker">🔫 Auto Bunker</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-scrapyard">
+                <label class="form-check-label" for="tmn-auto-scrapyard">⚙️ Auto Scrapyard</label>
               </div>
               <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-auto-crusher">
                 <label class="form-check-label" for="tmn-auto-crusher">Auto Crusher</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-notify-ocdtm-ready">
+                <label class="form-check-label" for="tmn-notify-ocdtm-ready">🔔 OC/DTM Alerts</label>
+              </div>
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="tmn-create-oc">
+                <label class="form-check-label" for="tmn-create-oc" id="tmn-create-oc-label" style="cursor:pointer; text-decoration:underline; color:#60a5fa;">🏢 Create OC</label>
               </div>
               <div class="form-check form-switch">
                 <input class="form-check-input" type="checkbox" id="tmn-whitelist-enabled">
@@ -6445,7 +7829,36 @@ let logoutNotificationSent = false;
                 </label>
 
                 <div class="mt-3">
-                  <small class="text-muted d-block mb-2">Per-car category overrides — choose what happens to each car when Auto Garage runs:</small>
+                  <small class="text-muted d-block mb-2">Auto Bunker: deposits any on-hand FMJ/JHP into the Artillery Bunker</small>
+                  <label class="form-label">Bunker check interval (min):
+                    <input type="number" id="tmn-bunker-interval" class="form-control form-control-sm tmn-compact-input" value="${Math.round(config.bunkerCheckInterval / 60)}" min="1" max="120">
+                  </label>
+                </div>
+
+                <div class="mt-3 p-2" style="background: rgba(0,0,0,0.2); border-radius: 4px;">
+                  <div class="form-check form-switch mb-1">
+                    <input class="form-check-input" type="checkbox" id="tmn-auto-bunker-extend">
+                    <label class="form-check-label" for="tmn-auto-bunker-extend">Auto Extend Bunker (uses credits)</label>
+                  </div>
+                  <small class="text-muted d-block">Watches the bunker's expiry date/time (shown on the Artillery Bunker panel) and, only once <b>48 hours or less</b> remain, buys the 14-day extension for ${BUNKER_EXT_COST} credits from the Credits page. Works independently of the deposit toggle above - reuses the same check interval to notice it's due, but never deposits bullets on its own.</small>
+                </div>
+
+                <div class="mt-3">
+                  <small class="text-muted d-block mb-2">Auto Scrapyard: buys 1000 FMJ at a time from the Scrapyard while you have enough scrap, then falls back to this interval once scrap runs out</small>
+                  <label class="form-label">Scrapyard check interval (min):
+                    <input type="number" id="tmn-scrapyard-interval" class="form-control form-control-sm tmn-compact-input" value="${Math.round(config.scrapyardCheckInterval / 60)}" min="1" max="240">
+                  </label>
+                </div>
+
+                <div class="mt-3">
+                  <small class="text-muted d-block mb-2">🛫 Auto Travel safety net: independently re-checks you're actually in the hot city, in case a DTM-completion trigger was missed - travels back immediately (private jet) if not</small>
+                  <label class="form-label">Hot city safety check interval (min):
+                    <input type="number" id="tmn-hotcity-safety-interval" class="form-control form-control-sm tmn-compact-input" value="${Math.round(config.hotCitySafetyCheckInterval / 60)}" min="5" max="240">
+                  </label>
+                </div>
+
+                <div class="mt-3">
+                  <small class="text-muted d-block mb-2">Per-car category overrides - choose what happens to each car when Auto Garage runs:</small>
                   <div style="background: rgba(0,0,0,0.2); border-radius: 4px; padding: 8px;">
                     <div style="display: grid; grid-template-columns: 1fr auto auto auto; gap: 6px 12px; align-items: center; font-size: 0.8rem;">
                       <div style="color:#9ca3af; font-weight: 600;">Car</div>
@@ -6457,7 +7870,7 @@ let logoutNotificationSent = false;
                         if (car.manual) {
                           // Manual-only cars get a single full-width "Manual only" label spanning all 3 radio columns
                           return `
-                            <div style="color:#9ca3af; font-style: italic;" title="Never auto-processed — handle manually in-game">${car.name} 🔧</div>
+                            <div style="color:#9ca3af; font-style: italic;" title="Never auto-processed - handle manually in-game">${car.name} 🔧</div>
                             <div style="grid-column: 2 / span 3; text-align: center; color:#6b7280; font-style: italic; font-size: 0.75rem;">Manual only</div>
                           `;
                         }
@@ -6465,7 +7878,7 @@ let logoutNotificationSent = false;
                         const disabled = car.locked ? 'disabled' : '';
                         const lockIcon = car.locked ? ' 🔒' : '';
                         const nameStyle = car.locked ? 'color:#9ca3af; font-style: italic;' : 'color:#cbd5e1;';
-                        const lockTitle = car.locked ? ' title="Locked — main OC car"' : '';
+                        const lockTitle = car.locked ? ' title="Locked - main OC car"' : '';
                         return `
                           <div style="${nameStyle}"${lockTitle}>${car.name}${lockIcon}</div>
                           <div style="text-align: center;"><input type="radio" name="tmn-carcat-${safeId}" data-car="${car.name}" value="OC" ${cat === 'OC' ? 'checked' : ''} ${disabled}></div>
@@ -6558,6 +7971,10 @@ let logoutNotificationSent = false;
                 <div class="form-check mb-2">
                   <input class="form-check-input" type="checkbox" id="tmn-notify-logout">
                   <label class="form-check-label" for="tmn-notify-logout">Notify on Logout/Timeout</label>
+                </div>
+                <div class="form-check mb-2">
+                  <input class="form-check-input" type="checkbox" id="tmn-notify-bank">
+                  <label class="form-check-label" for="tmn-notify-bank">Notify on Bank Withdrawal</label>
                 </div>
 
                 <button id="tmn-test-telegram" class="btn btn-sm btn-outline-success">Test Connection</button>
@@ -6777,6 +8194,8 @@ let logoutNotificationSent = false;
     shadowRoot.querySelector("#tmn-auto-jail").checked = state.autoJail;
     shadowRoot.querySelector("#tmn-auto-health").checked = state.autoHealth;
     shadowRoot.querySelector("#tmn-auto-garage").checked = state.autoGarage;
+    shadowRoot.querySelector("#tmn-auto-bunker").checked = state.autoBunker;
+    shadowRoot.querySelector("#tmn-auto-scrapyard").checked = state.autoScrapyard;
     shadowRoot.querySelector("#tmn-auto-crusher").checked = state.autoCrusher;
     // Grey out the Auto Crusher toggle if we've confirmed there's no crusher.
     // The user must use "Reset crusher status" in settings (e.g. after buying one).
@@ -6787,12 +8206,13 @@ let logoutNotificationSent = false;
       const crusherLabel = shadowRoot.querySelector('label[for="tmn-auto-crusher"]');
       if (crusherLabel) {
         crusherLabel.style.color = '#6b7280';
-        crusherLabel.title = 'Crusher not owned — use "Reset crusher status" in settings if you buy one';
+        crusherLabel.title = 'Crusher not owned - use "Reset crusher status" in settings if you buy one';
       }
     }
     shadowRoot.querySelector("#tmn-auto-oc").checked = state.autoOC;
     shadowRoot.querySelector("#tmn-create-oc").checked = state.createOC;
     shadowRoot.querySelector("#tmn-auto-dtm").checked = state.autoDTM;
+    shadowRoot.querySelector("#tmn-auto-travel-back").checked = state.autoTravelAfterDTM;
     shadowRoot.querySelector("#tmn-notify-ocdtm-ready").checked = state.notifyOCDTMReady;
 
     // Initialize ALL ON/OFF toggle
@@ -6856,11 +8276,21 @@ let logoutNotificationSent = false;
       saveState();
       updateStatus('Auto Garage ' + (state.autoGarage ? 'Enabled' : 'Disabled'));
     });
+    shadowRoot.querySelector("#tmn-auto-bunker").addEventListener('change', e => {
+      state.autoBunker = e.target.checked;
+      saveState();
+      updateStatus('Auto Bunker ' + (state.autoBunker ? 'Enabled' : 'Disabled'));
+    });
+    shadowRoot.querySelector("#tmn-auto-scrapyard").addEventListener('change', e => {
+      state.autoScrapyard = e.target.checked;
+      saveState();
+      updateStatus('Auto Scrapyard ' + (state.autoScrapyard ? 'Enabled' : 'Disabled'));
+    });
     shadowRoot.querySelector("#tmn-auto-crusher").addEventListener('change', e => {
       // Defence in depth: reject re-enable if we've confirmed no crusher
       if (e.target.checked && state.crusherOwned === false) {
         e.target.checked = false;
-        updateStatus('Crusher not owned — use "Reset crusher status" first');
+        updateStatus('Crusher not owned - use "Reset crusher status" first');
         return;
       }
       state.autoCrusher = e.target.checked;
@@ -6887,7 +8317,7 @@ let logoutNotificationSent = false;
         if (!state.carCategories) state.carCategories = {};
         state.carCategories[carName] = category;
         saveState();
-        updateStatus(`${carName} → ${category}`);
+        updateStatus(`${carName} -> ${category}`);
       });
     });
 
@@ -6897,7 +8327,7 @@ let logoutNotificationSent = false;
       carResetBtn.addEventListener('click', () => {
         state.carCategories = {};
         saveState();
-        // Re-check the default radio for each known car (skips locked — they already show default)
+        // Re-check the default radio for each known car (skips locked - they already show default)
         KNOWN_CARS.forEach(car => {
           const safeId = car.name.replace(/[^A-Za-z0-9]/g, '');
           const radios = shadowRoot.querySelectorAll(`input[type="radio"][name="tmn-carcat-${safeId}"]`);
@@ -6907,7 +8337,7 @@ let logoutNotificationSent = false;
       });
     }
 
-    // Reset crusher ownership status — clears the "no crusher" lockout so the script
+    // Reset crusher ownership status - clears the "no crusher" lockout so the script
     // will re-detect on the next garage cycle. Use after buying a crusher.
     const crusherResetBtn = shadowRoot.querySelector('#tmn-crusher-reset');
     if (crusherResetBtn) {
@@ -6928,7 +8358,7 @@ let logoutNotificationSent = false;
         // Update the status display
         const statusEl = shadowRoot.querySelector('#tmn-crusher-status');
         if (statusEl) statusEl.innerHTML = '<span style="color:#9ca3af;">Unknown</span>';
-        updateStatus('Crusher status reset — will re-detect on next garage visit');
+        updateStatus('Crusher status reset - will re-detect on next garage visit');
       });
     }
     shadowRoot.querySelector("#tmn-auto-oc").addEventListener('change', e => {
@@ -6950,6 +8380,18 @@ let logoutNotificationSent = false;
       } else {
         stopAutoDTMMailWatcher();
       }
+    });
+    shadowRoot.querySelector("#tmn-auto-travel-back").addEventListener('change', e => {
+      state.autoTravelAfterDTM = e.target.checked;
+      if (!state.autoTravelAfterDTM) {
+        // Turning it off mid-flight cancels anything already queued too.
+        state.pendingTravelBack = false;
+        state.travelBackInProgress = false;
+        state.travelBackQueuedAt = 0;
+        GM_setValue('travelBackStartedAt', 0);
+      }
+      saveState();
+      updateStatus('🛫 Auto Travel ' + (state.autoTravelAfterDTM ? 'Enabled' : 'Disabled'));
     });
 
     // Create OC toggle
@@ -6991,7 +8433,7 @@ let logoutNotificationSent = false;
       });
     }
 
-    // OC Team name inputs — save on blur
+    // OC Team name inputs - save on blur
     const teamTransInput = shadowRoot.querySelector('#tmn-oc-team-transporter');
     const teamWeaponInput = shadowRoot.querySelector('#tmn-oc-team-weapon');
     const teamExplosiveInput = shadowRoot.querySelector('#tmn-oc-team-explosive');
@@ -7014,7 +8456,7 @@ let logoutNotificationSent = false;
       });
     }
 
-    // OC Schedule time input — save on change
+    // OC Schedule time input - save on change
     const schedInput = shadowRoot.querySelector('#tmn-oc-schedule-time');
     if (schedInput) {
       schedInput.addEventListener('change', () => {
@@ -7024,7 +8466,7 @@ let logoutNotificationSent = false;
           const d = new Date(schedInput.value);
           updateStatus(`OC scheduled: ${formatDateUK(d)}`);
         } else {
-          updateStatus('OC schedule cleared — will trigger on cooldown');
+          updateStatus('OC schedule cleared - will trigger on cooldown');
         }
       });
     }
@@ -7133,7 +8575,8 @@ let logoutNotificationSent = false;
       localStorage.removeItem('tmnPendingOCHandleTs');
       localStorage.removeItem(LS_PENDING_DTM_URL);
       localStorage.removeItem(LS_PENDING_OC_URL);
-      updateStatus('OC/DTM cooldowns and pending invites cleared');
+      localStorage.removeItem(LS_PENDING_MAIL_DELETIONS);
+      updateStatus('OC/DTM cooldowns, pending invites and queued mail deletions cleared');
     });
 
     function renderWhitelistEntries() {
@@ -7167,7 +8610,6 @@ let logoutNotificationSent = false;
         container.innerHTML = '<small style="color:#9ca3af;">No players added. All invites accepted.</small>';
       }
     }
-
 
     // Online Watch toggle, settings, and modal
     const onlineWatchMainToggle = shadowRoot.querySelector("#tmn-online-watch-enabled");
@@ -7326,6 +8768,8 @@ let logoutNotificationSent = false;
       state.autoJail = allEnabled;
       state.autoHealth = allEnabled;
       state.autoGarage = allEnabled;
+      state.autoBunker = allEnabled;
+      state.autoScrapyard = allEnabled;
       state.autoOC = allEnabled;
       state.autoDTM = allEnabled;
 
@@ -7335,6 +8779,8 @@ let logoutNotificationSent = false;
       shadowRoot.querySelector("#tmn-auto-jail").checked = allEnabled;
       shadowRoot.querySelector("#tmn-auto-health").checked = allEnabled;
       shadowRoot.querySelector("#tmn-auto-garage").checked = allEnabled;
+      shadowRoot.querySelector("#tmn-auto-bunker").checked = allEnabled;
+      shadowRoot.querySelector("#tmn-auto-scrapyard").checked = allEnabled;
       shadowRoot.querySelector("#tmn-auto-oc").checked = allEnabled;
       shadowRoot.querySelector("#tmn-auto-dtm").checked = allEnabled;
 
@@ -7361,7 +8807,7 @@ let logoutNotificationSent = false;
     function updateAllToggleState() {
       const allToggle = shadowRoot.querySelector("#tmn-auto-all");
       const allLabel = shadowRoot.querySelector("#tmn-auto-all-label");
-      const allEnabled = state.autoCrime && state.autoGTA && state.autoBooze && state.autoJail && state.autoHealth && state.autoGarage && state.autoOC && state.autoDTM;
+      const allEnabled = state.autoCrime && state.autoGTA && state.autoBooze && state.autoJail && state.autoHealth && state.autoGarage && state.autoBunker && state.autoScrapyard && state.autoOC && state.autoDTM;
 
       allToggle.checked = allEnabled;
       allLabel.textContent = allEnabled ? 'ALL ON' : 'ALL OFF';
@@ -7431,6 +8877,37 @@ let logoutNotificationSent = false;
       GM_setValue("garageInterval", config.garageInterval);
       e.target.value = minutes;
     });
+    shadowRoot.querySelector('#tmn-bunker-interval').addEventListener('change', e => {
+      const minutes = Math.max(1, Math.min(120, parseInt(e.target.value)));
+      config.bunkerCheckInterval = minutes * 60; // Convert minutes to seconds for internal use
+      GM_setValue("bunkerCheckInterval", config.bunkerCheckInterval);
+      e.target.value = minutes;
+    });
+    shadowRoot.querySelector("#tmn-auto-bunker-extend").checked = state.autoBunkerExtend;
+    shadowRoot.querySelector("#tmn-auto-bunker-extend").addEventListener('change', e => {
+      state.autoBunkerExtend = e.target.checked;
+      if (!state.autoBunkerExtend) {
+        // Turning it off cancels anything queued - don't leave a stale
+        // pending purchase waiting to fire if it's re-enabled later at a
+        // point where the bunker's no longer close to expiring.
+        state.bunkerExtendPending = false;
+        state.bunkerExpiresAt = 0;
+      }
+      saveState();
+      updateStatus('🔫 Auto Extend Bunker ' + (state.autoBunkerExtend ? 'Enabled' : 'Disabled'));
+    });
+    shadowRoot.querySelector('#tmn-scrapyard-interval').addEventListener('change', e => {
+      const minutes = Math.max(1, Math.min(240, parseInt(e.target.value)));
+      config.scrapyardCheckInterval = minutes * 60; // Convert minutes to seconds for internal use
+      GM_setValue("scrapyardCheckInterval", config.scrapyardCheckInterval);
+      e.target.value = minutes;
+    });
+    shadowRoot.querySelector('#tmn-hotcity-safety-interval').addEventListener('change', e => {
+      const minutes = Math.max(5, Math.min(240, parseInt(e.target.value)));
+      config.hotCitySafetyCheckInterval = minutes * 60; // Convert minutes to seconds for internal use
+      GM_setValue("hotCitySafetyCheckInterval", config.hotCitySafetyCheckInterval);
+      e.target.value = minutes;
+    });
 
     // Health threshold settings
     shadowRoot.querySelector('#tmn-min-health').addEventListener('change', e => {
@@ -7491,11 +8968,12 @@ let logoutNotificationSent = false;
         localStorage.removeItem('tmnPendingDTMHandle');
         localStorage.removeItem('tmnPendingOCAcceptURL');
         localStorage.removeItem('tmnPendingDTMAcceptURL');
+        localStorage.removeItem('tmnPendingMailDeletions');
         localStorage.removeItem('tmnProtectionEndTs');
         localStorage.removeItem('tmnProtectionStatus');
         localStorage.removeItem('tmnProtWarn12h');
         localStorage.removeItem('tmnProtWarn6h');
-        updateStatus('Player data cleared — reload to detect new player');
+        updateStatus('Player data cleared - reload to detect new player');
         if (shadowRoot.updatePlayerBadge) shadowRoot.updatePlayerBadge();
       }
     });
@@ -7618,6 +9096,13 @@ let logoutNotificationSent = false;
       telegramConfig.notifyLogout = e.target.checked;
       saveTelegramConfig();
    });
+
+    shadowRoot.querySelector("#tmn-notify-bank").checked = telegramConfig.notifyBankWithdrawal;
+
+    shadowRoot.querySelector("#tmn-notify-bank").addEventListener('change', e => {
+      telegramConfig.notifyBankWithdrawal = e.target.checked;
+      saveTelegramConfig();
+    });
 
 
     shadowRoot.querySelector("#tmn-test-telegram").addEventListener('click', testTelegramConnection);
@@ -7772,7 +9257,6 @@ let logoutNotificationSent = false;
       setInterval(updateTabStatus, 5000);
     }
 
-// Minimizer
     // Minimizer
     const minimizeBtn = shadowRoot.querySelector('#tmn-minimize-btn');
     const body = shadowRoot.querySelector('#tmn-panel-body');
@@ -7818,7 +9302,7 @@ let logoutNotificationSent = false;
     function hideModal() {
       modal.classList.remove('show');
       modal.setAttribute('aria-hidden', 'true');
-      // Also close any popup modals (whitelist, OC leader) that share the backdrop
+      // Also close any popup modals (whitelist, OC leader, online watch) that share the backdrop
       const wlModal = shadowRoot.querySelector('#tmn-whitelist-modal');
       if (wlModal) { wlModal.classList.remove('show'); wlModal.setAttribute('aria-hidden', 'true'); }
       const ocLeaderModal = shadowRoot.querySelector('#tmn-oc-leader-modal');
@@ -7893,11 +9377,12 @@ async function mainLoop() {
     checkForNewMessages();
     checkForLogout();
     checkForLowHealth();
+    checkForBankWithdrawal();
 
-    // Staff script check — if detected, pause automation and alert
+    // Staff script check - if detected, pause automation and alert
     if (checkForSqlScriptCheck()) {
       automationPaused = true;
-      updateStatus('⚠️ STAFF CHECK — automation paused, respond manually!');
+      updateStatus('⚠️ STAFF CHECK - automation paused, respond manually!');
       setTimeout(mainLoop, 10000); // Keep checking in case it clears
       return;
     }
@@ -7955,13 +9440,13 @@ async function mainLoop() {
     if (state.createOC && !state.inJail) {
       const ocCreateState = getCreateOCState();
 
-      // IDLE: OC ready but waiting for scheduled time — poll every loop iteration
+      // IDLE: OC ready but waiting for scheduled time - poll every loop iteration
       if (ocCreateState === 'idle') {
         try {
           const ocStatus = getOCTimerStatus();
           const ocReady = ocStatus && (ocStatus.canOC === true || (ocStatus.totalSeconds || 0) <= 0);
           if (ocReady && isOCScheduleReady()) {
-            console.log('[TMN][CreateOC] Schedule + cooldown both ready — triggering');
+            console.log('[TMN][CreateOC] Schedule + cooldown both ready - triggering');
             triggerCreateOC();
           }
         } catch (e) {
@@ -7984,10 +9469,10 @@ async function mainLoop() {
             console.warn('[TMN][CreateOC] mainLoop handler error:', e);
           }
         } else {
-          // Not on OC page but in setup/polling — check if it's time to navigate back
+          // Not on OC page but in setup/polling - check if it's time to navigate back
           const nextCheck = parseInt(localStorage.getItem(LS_CREATE_OC_NEXT_CHECK) || '0', 10);
           if (nextCheck > 0 && Date.now() >= nextCheck && !state.isPerformingAction) {
-            console.log('[TMN][CreateOC] Time to check OC page — navigating');
+            console.log('[TMN][CreateOC] Time to check OC page - navigating');
             window.location.href = OC_URL + '?' + Date.now();
             setTimeout(mainLoop, 5000);
             return;
@@ -8016,22 +9501,20 @@ async function mainLoop() {
         saveState();
         updateStatus("🚚 Accepting DTM invite...");
         // Use URL path+search to avoid origin mismatch (www vs non-www)
-        scheduleOCDTMAction('Navigating to DTM invite', () => {
-          try {
-            const dtmUrl = new URL(pendingDTMUrl);
-            window.location.href = dtmUrl.pathname + dtmUrl.search;
-          } catch {
-            window.location.href = pendingDTMUrl.replace(/^https?:\/\/[^/]+/, '');
-          }
-        });
+        try {
+          const dtmUrl = new URL(pendingDTMUrl);
+          window.location.href = dtmUrl.pathname + dtmUrl.search;
+        } catch {
+          window.location.href = pendingDTMUrl.replace(/^https?:\/\/[^/]+/, '');
+        }
         return;
       }
 
       const pendingOCUrl = localStorage.getItem(LS_PENDING_OC_URL);
       if (pendingOCUrl && state.autoOC) {
-        // Don't navigate to OC page while in jail — wait for release
+        // Don't navigate to OC page while in jail - wait for release
         if (state.inJail) {
-          console.log('[TMN] Pending OC URL but in jail — waiting for release');
+          console.log('[TMN] Pending OC URL but in jail - waiting for release');
           // Don't remove the URL, keep it for when we're free
         } else {
           console.log('[TMN] Processing pending OC accept URL:', pendingOCUrl);
@@ -8056,22 +9539,38 @@ async function mainLoop() {
           saveState();
           updateStatus("🕵️ Accepting OC invite...");
           // Use URL path+search to avoid origin mismatch (www vs non-www)
-          scheduleOCDTMAction('Navigating to OC invite', () => {
-            try {
-              const ocUrl = new URL(pendingOCUrl);
-              window.location.href = ocUrl.pathname + ocUrl.search;
-            } catch {
-              window.location.href = pendingOCUrl.replace(/^https?:\/\/[^/]+/, '');
-            }
-          });
+          try {
+            const ocUrl = new URL(pendingOCUrl);
+            window.location.href = ocUrl.pathname + ocUrl.search;
+          } catch {
+            window.location.href = pendingOCUrl.replace(/^https?:\/\/[^/]+/, '');
+          }
           return;
         }
       }
     }
 
     // ===== PRIORITY 3: Check mail for new invites =====
-    // Runs every 60s normally, or IMMEDIATELY when on the mailbox page
-    if ((state.autoOC || state.autoDTM || (telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck)))
+    // Runs every 60s normally, or IMMEDIATELY when on the mailbox page.
+    // Gate widened so Script test and SQL/Stipe staff-mail alerts still scan when
+    // general "New Messages" notifications are disabled.
+    // v17.38 - added state.autoTravelAfterDTM here too. The v17.34 changelog
+    // claimed this outer gate was widened to also run for an Auto-Travel-only
+    // setup (so the DTM-completion-mail trigger could be seen), and
+    // unifiedMailCheck()'s own internal gate does check autoTravelAfterDTM -
+    // but this outer gate never actually got the flag added, so
+    // unifiedMailCheck() was never even called for a DTM leader running with
+    // only Auto Travel on (no Auto DTM/Auto OC, no relevant Telegram
+    // toggles) - the leader never goes through the invite-accept flow that
+    // sets tmnPendingDTMHandle (see handleDTMPageAfterAccept), so the mail
+    // trigger was their ONLY route to a queued travel-back, and it was being
+    // silently skipped every tick.
+    // v17.41 - same bug, same fix, now for state.autoBunkerExtend: its
+    // mail-based expiry detection (looksLikeBunkerWarning, above) is
+    // useless if unifiedMailCheck() never runs in the first place for a
+    // Bunker-Extend-only setup (no OC/DTM/Travel, no relevant Telegram
+    // toggles) - the inner gate already allowed it, this outer gate didn't.
+    if ((state.autoOC || state.autoDTM || state.autoTravelAfterDTM || state.autoBunkerExtend || (telegramConfig.enabled && (telegramConfig.notifyMessages || telegramConfig.notifyInboxScriptTest || telegramConfig.notifyStaffMailCheck)))
         && tabManager.isMasterTab) {
       const lastMailCheck = parseInt(localStorage.getItem('tmnLastMailCheckTs') || '0', 10);
       const mailCheckNow = Date.now();
@@ -8092,6 +9591,18 @@ async function mainLoop() {
       }
     }
 
+    // ===== PRIORITY 3.5: Auto-delete accepted OC/DTM invite mails =====
+    if (!state.inJail && !state.isPerformingAction) {
+      try {
+        if (checkAndProcessMailDeletions()) {
+          setTimeout(mainLoop, 3000);
+          return;
+        }
+      } catch (e) {
+        console.warn('[TMN][MAIL] Deletion check error:', e);
+      }
+    }
+
     // Check OC/DTM ready alerts (edge-triggered)
     try { checkOCDTMReadyAlerts(); } catch (e) {}
 
@@ -8105,11 +9616,24 @@ async function mainLoop() {
       }
     }
 
+    // v17.31 - Check bunker extension (credits) if one is queued - same
+    // high-priority pattern as Auto Health above, since it's the same kind
+    // of "navigate to Credits page and buy something" action. Detection of
+    // whether one is due lives in doBunkerSubmit (runs on the normal bunker
+    // page visit); this just drives it to completion once queued.
+    if (state.autoBunkerExtend && !state.isPerformingAction && state.bunkerExtendPending) {
+      checkAndExtendBunker();
+      if (state.bunkerExtendPending) {
+        setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
+        return;
+      }
+    }
+
     if (!state.isPerformingAction) {
       const currentPage = getCurrentPage();
       const now = Date.now();
 
-      if (!state.autoCrime && !state.autoGTA && !state.autoBooze && !state.autoJail && !state.autoGarage && !state.autoHealth && !state.autoOC && !state.autoDTM) {
+      if (!state.autoCrime && !state.autoGTA && !state.autoBooze && !state.autoJail && !state.autoGarage && !state.autoHealth && !state.autoOC && !state.autoDTM && !state.autoBunker && !state.autoBunkerExtend && !state.autoScrapyard) {
         if (now % 30000 < 2000) {
           updateStatus("Idle - no automation enabled");
         }
@@ -8139,6 +9663,170 @@ async function mainLoop() {
         const shouldDoJailbreak = state.autoJail && (now - state.lastJail >= config.jailbreakInterval * 1000);
         const shouldDoGarage = state.autoGarage && (now - state.lastGarage >= config.garageInterval * 1000);
 
+        // v17.27 - Artillery Bunker: pause ALL other actions (crime/GTA/
+        // booze/jailbreak/garage) while a bunker check is in progress,
+        // instead of competing with them for a turn. Previously the bunker
+        // check only got a turn in a low-priority branch that auto-
+        // jailbreak's frequent 3s interval almost always won, so it rarely
+        // ran; making it fully independent caused a different problem -
+        // competing async navigations (safeNavigate schedules the actual
+        // page load a couple seconds later) that could fire to two
+        // different pages in close succession and never let either finish
+        // loading. This pause flag fixes both: bunkerCheckInProgress is set
+        // the moment a check starts and is GM-backed so it survives the
+        // page reload mid-check; nothing else in this block runs again
+        // until it clears. It only clears once doBunkerSubmit() reaches a
+        // genuine end state (submitted with nothing left to deposit, no
+        // panel, no bullets, missing form controls, or a blocking page
+        // error) - a partial deposit (FMJ done, JHP still to go) leaves it
+        // set so the pause continues into the next tick instead of handing
+        // the turn to jailbreak before JHP gets submitted.
+        const bunkerOverdue = (state.autoBunker || state.autoBunkerExtend) && (now - state.lastBunkerCheck >= config.bunkerCheckInterval * 1000);
+        // Tracks whether the bunker logic below handled this tick, so the
+        // pendingAction/garage/priority-chain block further down gets
+        // skipped (paused) for this tick without ever using `return` here -
+        // mainLoop's own trailing setTimeout must still fire every tick even
+        // when a bunker check resolves without an actual page navigation
+        // (e.g. "no bullets to deposit"), or automation would silently stop
+        // rescheduling itself entirely.
+        let bunkerHandledThisTick = false;
+
+        if (state.bunkerCheckInProgress) {
+          // Safety watchdog: if a check has been "in progress" for over 90s
+          // (long enough for a couple of navigations plus the 3-20s deposit
+          // delay), something went wrong - clear the pause so automation
+          // isn't stuck forever.
+          const bunkerCheckStartedAt = GM_getValue('bunkerCheckStartedAt', 0);
+          if (bunkerCheckStartedAt && (now - bunkerCheckStartedAt > 90000)) {
+            console.warn('[TMN][BUNKER] Check stuck in progress for 90s+ - clearing pause and resuming other actions');
+            state.bunkerCheckInProgress = false;
+            state.lastBunkerCheck = now;
+            GM_setValue('bunkerCheckStartedAt', 0);
+            saveState();
+            // Don't set bunkerHandledThisTick - fall through to normal
+            // crime/GTA/etc handling now that the pause is cleared.
+          } else if (currentPage === 'bunker') {
+            doBunkerSubmit();
+            bunkerHandledThisTick = true;
+          } else {
+            updateStatus("Navigating to Artillery Bunker...");
+            safeNavigate('/authenticated/playerproperty.aspx?' + Date.now());
+            bunkerHandledThisTick = true;
+          }
+        } else if (bunkerOverdue) {
+          state.bunkerCheckInProgress = true;
+          GM_setValue('bunkerCheckStartedAt', now);
+          saveState();
+          if (currentPage === 'bunker') {
+            doBunkerSubmit();
+          } else {
+            updateStatus("Navigating to Artillery Bunker...");
+            safeNavigate('/authenticated/playerproperty.aspx?' + Date.now());
+          }
+          bunkerHandledThisTick = true;
+        }
+
+        // v17.28 - Scrapyard: same pause pattern as the bunker above, and
+        // deliberately only evaluated when the bunker didn't already claim
+        // this tick, so at most one "resource top-up" feature is ever
+        // navigating/submitting at a time (the whole reason the bunker
+        // needed this pattern in the first place - two independent features
+        // scheduling navigations in the same window race each other).
+        const scrapyardOverdue = state.autoScrapyard && (now - state.lastScrapyardCheck >= config.scrapyardCheckInterval * 1000);
+        let scrapyardHandledThisTick = false;
+
+        if (!bunkerHandledThisTick) {
+          if (state.scrapyardCheckInProgress) {
+            const scrapyardCheckStartedAt = GM_getValue('scrapyardCheckStartedAt', 0);
+            if (scrapyardCheckStartedAt && (now - scrapyardCheckStartedAt > 90000)) {
+              console.warn('[TMN][SCRAPYARD] Check stuck in progress for 90s+ - clearing pause and resuming other actions');
+              state.scrapyardCheckInProgress = false;
+              state.lastScrapyardCheck = now;
+              GM_setValue('scrapyardCheckStartedAt', 0);
+              saveState();
+              // Don't set scrapyardHandledThisTick - fall through to normal
+              // crime/GTA/etc handling now that the pause is cleared.
+            } else if (currentPage === 'scrapyard') {
+              doScrapyardSubmit();
+              scrapyardHandledThisTick = true;
+            } else {
+              updateStatus("Navigating to Scrapyard...");
+              safeNavigate('/authenticated/store.aspx?p=s&' + Date.now());
+              scrapyardHandledThisTick = true;
+            }
+          } else if (scrapyardOverdue) {
+            state.scrapyardCheckInProgress = true;
+            GM_setValue('scrapyardCheckStartedAt', now);
+            saveState();
+            if (currentPage === 'scrapyard') {
+              doScrapyardSubmit();
+            } else {
+              updateStatus("Navigating to Scrapyard...");
+              safeNavigate('/authenticated/store.aspx?p=s&' + Date.now());
+            }
+            scrapyardHandledThisTick = true;
+          }
+        }
+
+        // v17.29 - Travel back to hot city after DTM. Same "in progress"
+        // pause pattern as bunker/scrapyard, but the trigger isn't an
+        // interval - it's state.pendingTravelBack (set on DTM completion),
+        // gated (v17.32) by a fixed 22-minute wait from
+        // state.travelBackQueuedAt instead of the real travel cooldown -
+        // travel now uses the private jet (20-min real cooldown), so 22
+        // minutes gives a small buffer. While still waiting this
+        // deliberately does NOT claim the tick, so crime/GTA/etc keep
+        // running normally in the meantime - it only takes over once the
+        // 22 minutes are up.
+        let travelBackHandledThisTick = false;
+
+        // v17.45 - Hot city safety net: cheap timestamp check most ticks: if
+        // due, this sets pendingTravelBack (with an already-expired
+        // travelBackQueuedAt) so the block right below picks it up this
+        // same tick, exactly like a DTM-triggered queue would.
+        checkHotCitySafetyNet(now);
+
+        if (!bunkerHandledThisTick && !scrapyardHandledThisTick) {
+          if (state.travelBackInProgress) {
+            const travelBackStartedAt = GM_getValue('travelBackStartedAt', 0);
+            if (travelBackStartedAt && (now - travelBackStartedAt > 90000)) {
+              console.warn('[TMN][TRAVEL-BACK] Stuck in progress for 90s+ - clearing pause and giving up on this travel');
+              state.travelBackInProgress = false;
+              state.pendingTravelBack = false;
+              state.travelBackQueuedAt = 0;
+              GM_setValue('travelBackStartedAt', 0);
+              saveState();
+              // Don't set travelBackHandledThisTick - fall through to normal
+              // crime/GTA/etc handling now that the pause is cleared.
+            } else if (currentPage === 'travel') {
+              doTravelBackToHotCity();
+              travelBackHandledThisTick = true;
+            } else {
+              updateStatus("Navigating to Airport to travel back to hot city...");
+              safeNavigate('/authenticated/travel.aspx?' + Date.now());
+              travelBackHandledThisTick = true;
+            }
+          } else if (state.autoTravelAfterDTM && state.pendingTravelBack) {
+            const queuedAt = state.travelBackQueuedAt || 0;
+            if (queuedAt && (now - queuedAt) >= TRAVEL_BACK_DELAY_MS) {
+              state.travelBackInProgress = true;
+              GM_setValue('travelBackStartedAt', now);
+              saveState();
+              if (currentPage === 'travel') {
+                doTravelBackToHotCity();
+              } else {
+                updateStatus("Navigating to Airport to travel back to hot city...");
+                safeNavigate('/authenticated/travel.aspx?' + Date.now());
+              }
+              travelBackHandledThisTick = true;
+            }
+            // else: still waiting out the 22-minute delay - don't claim the
+            // tick, let crime/GTA/etc proceed normally; we'll check again
+            // next tick.
+          }
+        }
+
+        if (!bunkerHandledThisTick && !scrapyardHandledThisTick && !travelBackHandledThisTick) {
         // Check if we have a pending action from being jailed
         if (state.pendingAction) {
           updateStatus(`Resuming pending action: ${state.pendingAction}`);
@@ -8244,11 +9932,18 @@ async function mainLoop() {
           const jailRemaining = Math.max(0, Math.ceil((config.jailbreakInterval * 1000 - (now - state.lastJail)) / 1000));
           const garageRemainingSec = Math.max(0, Math.ceil((config.garageInterval * 1000 - (now - state.lastGarage)) / 1000));
           const garageRemainingMin = Math.ceil(garageRemainingSec / 60);
+          const bunkerRemainingSec = Math.max(0, Math.ceil((config.bunkerCheckInterval * 1000 - (now - state.lastBunkerCheck)) / 1000));
+          const bunkerRemainingMin = Math.ceil(bunkerRemainingSec / 60);
+          const scrapyardRemainingSec = Math.max(0, Math.ceil((config.scrapyardCheckInterval * 1000 - (now - state.lastScrapyardCheck)) / 1000));
+          const scrapyardRemainingMin = Math.ceil(scrapyardRemainingSec / 60);
 
-          if (crimeRemaining > 0 || gtaRemaining > 0 || boozeRemaining > 0 || jailRemaining > 0 || garageRemainingSec > 0) {
+          if (crimeRemaining > 0 || gtaRemaining > 0 || boozeRemaining > 0 || jailRemaining > 0 || garageRemainingSec > 0 || bunkerRemainingSec > 0 || scrapyardRemainingSec > 0) {
             const pendingInfo = state.pendingAction ? `, Pending: ${state.pendingAction}` : '';
-            updateStatus(`Crime ${crimeRemaining}s, GTA ${gtaRemaining}s, Booze ${boozeRemaining}s, Jail ${jailRemaining}s, Garage ${garageRemainingMin}m${pendingInfo}`);
+            const bunkerInfo = (state.autoBunker || state.autoBunkerExtend) ? `, Bunker ${bunkerRemainingMin}m` : '';
+            const scrapyardInfo = state.autoScrapyard ? `, Scrapyard ${scrapyardRemainingMin}m` : '';
+            updateStatus(`Crime ${crimeRemaining}s, GTA ${gtaRemaining}s, Booze ${boozeRemaining}s, Jail ${jailRemaining}s, Garage ${garageRemainingMin}m${bunkerInfo}${scrapyardInfo}${pendingInfo}`);
           }
+        }
         }
       }
     }
@@ -8283,11 +9978,11 @@ async function mainLoop() {
     try { initHotCity(); } catch (e) { console.warn('[TMN][HotCity] init error:', e); }
 
     // NOTE: Mail checking is now integrated into mainLoop (Priority 3) with localStorage-based cooldown.
-    // No separate timer needed — survives page navigations unlike the old setInterval/setTimeout approach.
+    // No separate timer needed - survives page navigations unlike the old setInterval/setTimeout approach.
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.20 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.46 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
