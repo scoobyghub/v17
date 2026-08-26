@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.46
+// @name         TMN TDS Auto v17.56
 // @namespace    http://tampermonkey.net/
-// @version      17.46
-// @description  v17.46 — Auto-login fix: don't require a captcha token when no captcha is rendered on the login page
+// @version      17.56
+// @description  v17.56 — Add "Auto Login" switch to the main panel (mirrors Settings' Auto-submit-after-captcha)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -22,6 +22,209 @@
 // ==/UserScript==
 
 /*
+TMN TDS Auto v17.56 — changelog
+
+FIX IN v17.56:
+- Added an 8px gap between the Auto Login switch and its label so the text
+  has the same comfortable spacing as the other switches.
+- Kept the vertical alignment with the Prot timer unchanged.
+- No Auto Login functionality or timing changed.
+
+FIX IN v17.56:
+- Corrected the Auto Login vertical position in the Prot row.
+- Auto Login now uses an explicit flex-centred row with Bootstrap's default
+  switch top/bottom margins neutralised, so the switch is vertically level
+  with the Prot timer content rather than sitting slightly high.
+- No login behaviour, timing, settings synchronisation, or other UI rows changed.
+
+FIX IN v17.56:
+- Moved Auto Login into the normal two-column toggle layout directly beneath
+  the DTM timer row, using the exact same form-switch spacing and styling as
+  the other Auto toggles. Removed the custom alignment overrides from v17.53.
+- Auto Login remains in the right-hand column beneath DTM, while Prot remains
+  in the left-hand column, so the timer and switch rows line up consistently.
+- No Auto Login functionality, setting, synchronisation, or login timing was changed.
+
+FIX IN v17.56:
+- Main-panel Auto Login is now vertically and horizontally aligned with the
+  Prot timer row. The switch container uses the same centered flex alignment
+  as the timer cell, removes Bootstrap's default switch padding/float offsets,
+  and keeps the label/switch group centered as one unit. No Auto Login logic
+  or setting behavior was changed.
+
+NEW IN v17.56:
+- Added an "Auto Login" switch to the main panel, right under the DTM
+  timer row, styled the same as the other Auto toggles (Auto Garage, Auto
+  Booze, etc). It's the same underlying setting as "Auto-submit after
+  captcha" in Settings (LOGIN_CONFIG.AUTO_SUBMIT_ENABLED) - not a new
+  feature, just a second, more convenient place to flip it without opening
+  Settings. Since the Settings modal is always present in the DOM (just
+  hidden/shown via a class, not created/destroyed), both switches are live
+  at the same time - toggling either one now updates the other so they
+  never show conflicting states.
+
+--- v17.51 changelog below ---
+
+TMN TDS Auto v17.51 — changelog
+
+Full audit pass for hangs/errors/performance, requested after the v17.50
+retry-race fix. Two real issues found and fixed; everything else checked
+(mainLoop's ~15 reschedule points, all setInterval/setTimeout recursive
+chains, tab-master enforcement, watchdog timestamps) came back clean.
+
+FIX IN v17.51:
+- Real hang bug in mainLoop's "resume pending action" block (crime/GTA/
+  booze). Every other early `return` in this ~700-line function is
+  preceded by either a setTimeout(mainLoop, ...) reschedule or an actual
+  page navigation (which reloads the page and restarts the whole script
+  via init()). This one block was the sole exception: when the pending
+  action's target page was already the active page, it ran the action and
+  returned with neither - permanently killing the recursive mainLoop chain
+  until a manual page reload, with no error or warning anywhere. Only
+  reachable via a specific combination (released from jail while already
+  sitting on the matching page with a pending action queued), which is
+  likely why it went unnoticed until now. All three branches (crime/gta/
+  booze) now reschedule before returning, matching every other path.
+- Added a top-level try/catch around the entirety of mainLoop(). Nothing
+  previously wrapped the whole function - if literally anything inside it
+  ever threw an uncaught error (an unexpected DOM shape from a site
+  change, a null reference, anything not already individually try/caught
+  somewhere inside), the exception would propagate out of the
+  setTimeout-based callback uncaught, and since nothing downstream of the
+  throw would run, none of mainLoop's own reschedule calls would fire
+  either - the entire loop would die silently and permanently. This is a
+  standing-risk class of bug (not tied to one specific line), and the new
+  catch-all guards against any instance of it, present or future: log the
+  error, then always reschedule, exactly like every normal path already
+  does. The catch block itself has a nested try around its own logging so
+  that even a failure in the recovery path can't skip the reschedule.
+
+--- v17.50 changelog below ---
+
+TMN TDS Auto v17.50 — changelog
+
+FIX IN v17.50:
+- Crime/GTA/booze all had a "no buttons/options found on page" retry path
+  (up to 3 attempts) meant to force a full page reload so the next attempt
+  sees fresh DOM. The reload was gated behind state.needsRefresh, but the
+  retry code set that flag inside a setTimeout(..., 2000) instead of
+  immediately - and mainLoop reschedules itself every ~1.8-3.2s on its own.
+  That's a race: the next mainLoop tick could easily fire before the
+  delayed flag was ever set, meaning the page never actually got told to
+  reload - it just burned through the retry counter finding nothing, tick
+  after tick, until it gave up. Now the flag is set synchronously the
+  moment a retry is scheduled, so the very next tick reliably sees it and
+  reloads - no more race.
+- Crime's and booze's "retries exhausted, giving up" branches never set
+  needsRefresh at all (GTA's did) - so once either of those gave up, they
+  stayed permanently stuck reporting "no buttons/options found" forever,
+  with no path back to a working state short of a manual page reload. Both
+  now set needsRefresh = true on give-up too, matching GTA's behavior.
+
+--- v17.49 changelog below ---
+
+TMN TDS Auto v17.49 — changelog
+
+FIX IN v17.49:
+- Fixed a real stuck-forever bug in transportCarsToHotCity() (added v17.46).
+  When a travel-back was queued and the player wasn't already in the hot
+  city, that function would try to resolve the hot city name by reading the
+  live .hot-marked span on travel.aspx (the getHotCity() cache is often
+  empty when a travel-back first queues). If that live read ever failed to
+  find a marker - page not fully loaded, a brief gap between hot-city
+  rotations, whatever the cause - the function just `return`ed with zero
+  state change. The caller in mainLoop set travelBackHandledThisTick = true
+  regardless of what the function actually did, so every single tick kept
+  landing back on this same dead end: parked on the Airport page, claiming
+  every tick, permanently blocking crime/GTA/booze/jailbreak/garage/bunker/
+  scrapyard - every other action - with no way out. This matches reports of
+  the script "getting stuck checking the airport and nothing else cycling."
+  Fixes:
+    - That dead end now gives up on car transport specifically (sets
+      carsTransportedForThisTravelBack = true) instead of looping forever.
+      doTransportBackToHotCity() runs right after on the same cycle and has
+      its own independent, already-correct handling for a genuine
+      "no hot city found" case.
+    - Added a 90-second watchdog around the car-transport step itself
+      (carTransportStartedAt), mirroring the one that already existed for
+      the jet-travel step, as defense-in-depth against any other
+      not-yet-found stuck path in this newer code.
+    - The watchdog timestamp is now reset to 0 everywhere
+      carsTransportedForThisTravelBack gets reset to false for a fresh
+      travel-back cycle (all four DTM triggers, the hot city safety net, and
+      toggling Auto Travel off mid-flight) - otherwise a stale timestamp
+      left over from a previous cycle could make a brand new cycle
+      immediately think it's "been stuck for 90s" on its very first attempt.
+
+--- v17.48 changelog below ---
+
+TMN TDS Auto v17.48 — changelog
+
+NEW IN v17.48:
+- Auto Garage and Auto Travel After DTM now default to true (were false)
+  for any install with no saved value yet. The car-transport-before-
+  travel-back feature added in v17.47 depends on both of these being on -
+  without them, the whole flow silently never fires (no error, cars just
+  get left behind and the script flies back anyway). Only affects fresh
+  installs/cleared storage; an existing false stays false until toggled in
+  the settings panel.
+- Debug hook: exposes the live in-memory state object as tmnDebugState in
+  the page console (via unsafeWindow, falling back to window). Since
+  GM_getValue/GM_setValue storage isn't readable from the ordinary page
+  console and Tampermonkey's own Storage/Values tab isn't present in every
+  version's UI, this gives a always-available way to check what the script
+  currently thinks its own state is (autoGarage, pendingTravelBack, etc.)
+  without either of those. It's a live reference to the same object
+  mainLoop reads/writes, so re-running `tmnDebugState` in the console shows
+  current values, not a one-time snapshot. Read-only inspection only -
+  don't set values through it, use the settings panel so changes get
+  persisted via saveState()/GM_setValue like normal.
+
+--- v17.47 changelog below ---
+
+TMN TDS Auto v17.47 — changelog
+
+NEW IN v17.47:
+- Transport garage cars to hot city before flying back. Previously, when a
+  travel-back was queued (any of the four DTM triggers, or the v17.45 hot
+  city safety net) and you weren't already sitting in the hot city, the
+  script would jet straight back and any cars sitting in the garage got
+  left behind wherever you were. Now, right before the jet-travel step,
+  mainLoop checks isInHotCity(): if false, it routes to the garage page
+  first, ticks every car's checkbox, sets the "Transport selected cars to:"
+  dropdown (ddlCities) to the hot city, and clicks Transport - only once
+  that's done (or confirmed unnecessary: already in hot city, garage empty,
+  or Auto Garage toggle is off) does it proceed to the existing jet-travel
+  flow. New state: pendingCarTransport (routing flag) and
+  carsTransportedForThisTravelBack (one-shot latch, reset to false at every
+  site that queues a travel-back, since transporting cars doesn't move the
+  player - isInHotCity() alone can't tell "still needs transporting" apart
+  from "already handled, waiting on the jet").
+  City-name → dropdown-value mapping (ddlCities option values) is hardcoded
+  from the six cities currently in the select: Paris=1, Las Vegas=2,
+  Sydney=4, London=5, New York=6, Toronto=7. Value "3" hasn't been observed
+  - if the hot city ever resolves to a name not in this map, transport is
+  skipped with a warning rather than guessing, and the script still flies
+  back on schedule.
+  Unlike the crusher (which sends exactly one car at a time to dodge a
+  "not your car" rejection on gifted cars), this selects and transports ALL
+  garage cars in one submission - there's no known equivalent restriction
+  on Transport. Revisit doGarage/crusher's per-car pattern here if that
+  turns out wrong.
+
+FIX IN v17.47 (same day):
+- transportCarsToHotCity() originally read the target city name from
+  getHotCity()'s localStorage cache, which is only populated when the
+  stats page has been scraped recently and can easily be empty right when
+  a travel-back is queued - produced a "no known city-id mapping for hot
+  city 'null'" warning and skipped transport entirely. Now, if the cache
+  is empty, it detours through travel.aspx first, reads the hot city LIVE
+  off the same .hot-marked span doTravelBackToHotCity() already trusts,
+  refreshes the cache via saveHotCity(), then continues on to the garage
+  once the name is known.
+
+--- v17.46 changelog below ---
+
 TMN TDS Auto v17.46 — changelog
 
 FIX IN v17.46:
@@ -955,7 +1158,7 @@ No changes intended to bypass site detection or restrictions; reliability/load c
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.46\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.56\n${message}`;
     }
 
     function clearTimers() {
@@ -1386,7 +1589,11 @@ if (currentPath.includes("/authenticated/")) {
     autoJail: GM_getValue('autoJail', false),
     autoBooze: GM_getValue('autoBooze', false),
     autoHealth: GM_getValue('autoHealth', false),
-    autoGarage: GM_getValue('autoGarage', false),
+    // v17.48 - defaults to true (was false) so a fresh install has Auto
+    // Garage on out of the box - needed for the car-transport-before-
+    // travel-back step to run at all. Only affects installs with no saved
+    // value yet; an existing false stays false until toggled in the UI.
+    autoGarage: GM_getValue('autoGarage', true),
     // v17.24 - Artillery Bunker auto-deposit
     autoBunker: GM_getValue('autoBunker', false),
     autoCrusher: GM_getValue('autoCrusher', true),
@@ -1429,7 +1636,12 @@ if (currentPath.includes("/authenticated/")) {
     // cleared once a genuine end state is reached (traveled, already there,
     // no hot city found, or missing controls) - it is NOT time-based; it
     // waits on the real travel cooldown via getTravelTimerStatus().
-    autoTravelAfterDTM: GM_getValue('autoTravelAfterDTM', false),
+    // v17.48 - defaults to true (was false), same reasoning as autoGarage
+    // above: this is the master switch for the whole travel-back flow
+    // (including the new car-transport step ahead of it), so a fresh
+    // install should have it on by default. Only affects installs with no
+    // saved value yet.
+    autoTravelAfterDTM: GM_getValue('autoTravelAfterDTM', true),
     pendingTravelBack: GM_getValue('pendingTravelBack', false),
     // v17.32 - timestamp (ms) of when the DTM completed that queued this
     // travel-back. Replaces the old real-cooldown check (getTravelTimerStatus)
@@ -1441,6 +1653,19 @@ if (currentPath.includes("/authenticated/")) {
     // triggers above.
     lastHotCitySafetyCheck: GM_getValue('lastHotCitySafetyCheck', 0),
     travelBackInProgress: GM_getValue('travelBackInProgress', false),
+    // v17.46 - Pre-travel-back car transport. Before flying back to the hot
+    // city, if we're not already sitting in it, garage cars need to be sent
+    // there too (Transport-selected-cars-to dropdown on the garage page) or
+    // they get left behind. pendingCarTransport gates mainLoop into the
+    // garage-transport step instead of the jet-travel step; carsTransported
+    // ForThisTravelBack is a one-shot latch so we don't try to transport
+    // again every tick once cars are already gone (transporting cars doesn't
+    // move the player, so isInHotCity() alone can't tell "already handled"
+    // apart from "still needs handling"). Reset to false everywhere
+    // pendingTravelBack is freshly set to true.
+    pendingCarTransport: GM_getValue('pendingCarTransport', false),
+    carsTransportedForThisTravelBack: GM_getValue('carsTransportedForThisTravelBack', false),
+    lastCarTransport: GM_getValue('lastCarTransport', 0),
     selectedCrimes: GM_getValue('selectedCrimes', [1]),
     selectedGTAs: GM_getValue('selectedGTAs', [5]),
     playerName: GM_getValue('playerName', ''),
@@ -1474,6 +1699,12 @@ if (currentPath.includes("/authenticated/")) {
     ocRepeatsLeft: GM_getValue('ocRepeatsLeft', 0)
   };
 
+  // Debug hook (v17.48) - exposes the live state object to the page console
+  // so it can be inspected as `tmnDebugState` without needing Tampermonkey's
+  // Storage tab (not present in every TM version/UI). Read-only inspection
+  // only; do not edit values through this - use the script's own UI toggles.
+  try { unsafeWindow.tmnDebugState = state; } catch (e) { try { window.tmnDebugState = state; } catch (e2) {} }
+
   let automationPaused = false;
 
   function saveState() {
@@ -1505,6 +1736,9 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('travelBackQueuedAt', state.travelBackQueuedAt);
     GM_setValue('lastHotCitySafetyCheck', state.lastHotCitySafetyCheck);
     GM_setValue('travelBackInProgress', state.travelBackInProgress);
+    GM_setValue('pendingCarTransport', state.pendingCarTransport);
+    GM_setValue('carsTransportedForThisTravelBack', state.carsTransportedForThisTravelBack);
+    GM_setValue('lastCarTransport', state.lastCarTransport);
     GM_setValue('selectedCrimes', state.selectedCrimes);
     GM_setValue('selectedGTAs', state.selectedGTAs);
     GM_setValue('playerName', state.playerName);
@@ -1712,6 +1946,7 @@ if (currentPath.includes("/authenticated/")) {
         'autoBunkerExtend', 'bunkerExtendPending', 'bunkerExpiresAt',
         'autoScrapyard', 'lastScrapyardCheck', 'scrapyardCheckInProgress',
         'autoTravelAfterDTM', 'pendingTravelBack', 'travelBackInProgress', 'travelBackQueuedAt', 'lastHotCitySafetyCheck',
+        'pendingCarTransport', 'carsTransportedForThisTravelBack', 'lastCarTransport', 'carTransportStartedAt',
 
         // Config values
         'crimeInterval', 'gtaInterval', 'jailbreakInterval', 'jailCheckInterval', 'boozeInterval',
@@ -3876,6 +4111,8 @@ let logoutNotificationSent = false;
                 if (state.autoTravelAfterDTM) {
                   state.pendingTravelBack = true;
                   state.travelBackQueuedAt = Date.now();
+                  state.carsTransportedForThisTravelBack = false;
+                  GM_setValue('carTransportStartedAt', 0); // v17.49 - fresh cycle, clear any stale watchdog timestamp
                   saveState();
                   console.log('[TMN][TRAVEL-BACK] Will travel back via private jet in 22 minutes');
                 }
@@ -4622,6 +4859,8 @@ let logoutNotificationSent = false;
         if (state.autoTravelAfterDTM) {
           state.pendingTravelBack = true;
           state.travelBackQueuedAt = Date.now();
+          state.carsTransportedForThisTravelBack = false;
+          GM_setValue('carTransportStartedAt', 0); // v17.49 - fresh cycle, clear any stale watchdog timestamp
           saveState();
           console.log('[TMN][TRAVEL-BACK] DTM completed - will travel back via private jet in 22 minutes');
         }
@@ -4748,6 +4987,8 @@ let logoutNotificationSent = false;
         if (state.autoTravelAfterDTM) {
           state.pendingTravelBack = true;
           state.travelBackQueuedAt = Date.now();
+          state.carsTransportedForThisTravelBack = false;
+          GM_setValue('carTransportStartedAt', 0); // v17.49 - fresh cycle, clear any stale watchdog timestamp
           saveState();
           console.log('[TMN][TRAVEL-BACK] DTM completed (buy max drugs) - will travel back via private jet in 22 minutes');
         }
@@ -4784,6 +5025,8 @@ let logoutNotificationSent = false;
         if (state.autoTravelAfterDTM) {
           state.pendingTravelBack = true;
           state.travelBackQueuedAt = Date.now();
+          state.carsTransportedForThisTravelBack = false;
+          GM_setValue('carTransportStartedAt', 0); // v17.49 - fresh cycle, clear any stale watchdog timestamp
           saveState();
           console.log('[TMN][TRAVEL-BACK] DTM completed (buy prefilled drugs) - will travel back via private jet in 22 minutes');
         }
@@ -5410,18 +5653,29 @@ let logoutNotificationSent = false;
         state.isPerformingAction = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
-        // Force a page reload on retry to ensure fresh DOM
-        setTimeout(() => {
-          state.needsRefresh = true;
-          saveState();
-        }, 2000);
+        // v17.50 - Force a page reload on retry to ensure fresh DOM. This
+        // used to be delayed 2s via setTimeout, but mainLoop reschedules
+        // itself every ~1.8-3.2s on its own - the next tick could easily
+        // fire before that delayed flag was ever set, meaning the page
+        // never actually got told to refresh and the retry counter just
+        // burned through itself doing nothing. Set the flag immediately;
+        // mainLoop's own scheduling delay already provides the "wait"
+        // before the next attempt.
+        state.needsRefresh = true;
+        saveState();
         return;
       }
       localStorage.removeItem(retryKey);
       updateStatus("No available crime buttons found");
       state.isPerformingAction = false;
       state.currentAction = '';
+      // v17.50 - also force a refresh once retries are exhausted (GTA's
+      // give-up branch already did this; crime's didn't, so it just stayed
+      // permanently stuck reporting "no buttons found" every tick with no
+      // way to recover without a manual reload).
+      state.needsRefresh = true;
       GM_setValue('actionStartTime', 0);
+      saveState();
       return;
     }
     // Clear retry counter on success
@@ -5504,10 +5758,10 @@ let logoutNotificationSent = false;
         state.isPerformingAction = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
-        setTimeout(() => {
-          state.needsRefresh = true;
-          saveState();
-        }, 2000);
+        // v17.50 - set immediately instead of after a 2s setTimeout; see
+        // the crime-retry comment above for why the delay was a race bug.
+        state.needsRefresh = true;
+        saveState();
         return;
       }
       localStorage.removeItem(retryKey);
@@ -5654,17 +5908,21 @@ let logoutNotificationSent = false;
         state.isPerformingAction = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
-        setTimeout(() => {
-          state.needsRefresh = true;
-          saveState();
-        }, 2000);
+        // v17.50 - set immediately instead of after a 2s setTimeout; see
+        // the crime-retry comment above for why the delay was a race bug.
+        state.needsRefresh = true;
+        saveState();
         return;
       }
       localStorage.removeItem(retryKey);
       updateStatus("No booze options available");
       state.isPerformingAction = false;
       state.currentAction = '';
+      // v17.50 - also force a refresh once retries are exhausted, same fix
+      // as crime's give-up branch above (this one had the identical gap).
+      state.needsRefresh = true;
       GM_setValue('actionStartTime', 0);
+      saveState();
     }
   }
 
@@ -6832,11 +7090,204 @@ let logoutNotificationSent = false;
 
     state.lastHotCitySafetyCheck = now;
     state.pendingTravelBack = true;
+    state.carsTransportedForThisTravelBack = false;
+    GM_setValue('carTransportStartedAt', 0); // v17.49 - fresh cycle, clear any stale watchdog timestamp
     // Already "expired" relative to TRAVEL_BACK_DELAY_MS, so the mainLoop
     // gate treats this as immediately due instead of waiting 22 more minutes.
     state.travelBackQueuedAt = now - TRAVEL_BACK_DELAY_MS - 1000;
     saveState();
     console.log('[TMN][TRAVEL-BACK] Hot city safety net check due - verifying current city now');
+  }
+
+  // ---------------------------
+  // Transport Garage Cars to Hot City before flying back (v17.46)
+  // ---------------------------
+  // Whenever a travel-back is queued (state.pendingTravelBack) but we're
+  // NOT currently sitting in the hot city, any cars in the garage are
+  // presumably wherever we are right now too - not the hot city. If we just
+  // jet back without moving them, they get left behind. So mainLoop routes
+  // here FIRST (see the pendingTravelBack gate below) whenever that's the
+  // case, and only proceeds to doTravelBackToHotCity() once this reports
+  // done (transported, nothing to transport, or skipped for a known
+  // reason). Reuses the garage page's own "Transport selected cars to:
+  // <ddlCities>" + "Transport" button - the same UI Auto Garage's crusher
+  // logic already knows how to reach.
+  //
+  // Unlike the crusher (which sends exactly one car at a time to dodge a
+  // "not your car" error on gifted cars), this selects and transports ALL
+  // garage cars in a single submission - there's no known equivalent
+  // rejection risk for transport, and going car-by-car would mean a
+  // separate page load per car for no benefit. If that assumption turns
+  // out wrong for some account, this is the first place to revisit.
+  //
+  // carsTransportedForThisTravelBack is a one-shot latch, reset to false at
+  // every site that sets pendingTravelBack = true. It exists because
+  // transporting cars doesn't move the player - isInHotCity() alone can't
+  // tell "still needs transporting" apart from "already handled, just
+  // waiting on the jet" once transport succeeds.
+  const CAR_TRANSPORT_CITY_IDS = {
+    'paris': '1',
+    'las vegas': '2',
+    'sydney': '4',
+    'london': '5',
+    'new york': '6',
+    'toronto': '7'
+    // NOTE: option value "3" hasn't been seen yet. If TMN's ddlCities list
+    // ever shows a city not in this map, transport is skipped (with a
+    // warning) rather than guessing - add it here once known.
+  };
+
+  function transportCarsToHotCity() {
+    if (!state.autoTravelAfterDTM || !state.pendingTravelBack) {
+      state.pendingCarTransport = false;
+      return;
+    }
+    if (state.isPerformingAction || state.inJail || automationPaused) return;
+
+    // Already handled this cycle, or turns out we're already in the hot
+    // city after all - nothing to transport, let mainLoop fall through to
+    // the jet-travel step next tick.
+    if (state.carsTransportedForThisTravelBack || isInHotCity()) {
+      state.pendingCarTransport = false;
+      saveState();
+      return;
+    }
+
+    // Auto Garage off = script isn't authorized to touch the garage page at
+    // all. Skip transport and just fly back - cars stay put.
+    if (!state.autoGarage) {
+      console.log('[TMN][CAR-TRANSPORT] Auto Garage is off - skipping car transport, flying back without moving cars');
+      state.carsTransportedForThisTravelBack = true;
+      state.pendingCarTransport = false;
+      saveState();
+      return;
+    }
+
+    // Resolve the hot city NAME before we can pick a garage-dropdown option.
+    // getHotCity() reads a localStorage cache that's only populated when the
+    // stats page has been scraped recently - it can easily be empty right
+    // when a travel-back is queued, which is what produced the "unknown
+    // hot city null" warning. doTravelBackToHotCity() never hits this
+    // because it reads the hot city LIVE off travel.aspx's .hot-marked
+    // span rather than the cache. Do the same here: if the cache is empty,
+    // detour through travel.aspx first, scrape the live marker, refresh the
+    // cache via saveHotCity(), then continue on to the garage on a later
+    // tick once it's known.
+    let hotCity = getHotCity();
+    if (!hotCity) {
+      if (getCurrentPage() === 'travel') {
+        try {
+          const hotCitySpan = document.querySelector('#ctl00_main_citieslist .hot');
+          const label = hotCitySpan ? hotCitySpan.querySelector('label') : null;
+          const liveName = label ? (label.textContent.split(' - ')[0] || '').trim() : '';
+          if (liveName) {
+            saveHotCity(liveName);
+            hotCity = liveName;
+            console.log(`[TMN][CAR-TRANSPORT] Refreshed hot city cache from live travel page: "${liveName}"`);
+          }
+        } catch (e) {
+          console.warn('[TMN][CAR-TRANSPORT] Failed to read hot city from travel page:', e);
+        }
+        if (!hotCity) {
+          // v17.49 fix: this used to just `return` here with no state
+          // change at all - if the live .hot marker was ever missing for
+          // more than an instant (page not fully loaded, a brief gap
+          // between hot-city rotations, whatever the cause), mainLoop kept
+          // calling this every tick, kept hitting this same dead end, and
+          // kept claiming the tick anyway (travelBackHandledThisTick is set
+          // by the caller regardless of what this function did) - a
+          // permanent stall that blocked crime/GTA/every other action.
+          // Give up on car transport specifically instead of retrying
+          // forever: doTravelBackToHotCity() runs right after this on the
+          // very next tick and does its own independent read of the same
+          // .hot marker - if it was just a transient timing hiccup, that
+          // attempt has a good chance of succeeding; if the marker is
+          // genuinely absent, that function already handles it correctly
+          // (clears pendingTravelBack and logs, rather than looping).
+          console.warn('[TMN][CAR-TRANSPORT] No hot city marker found on travel page - giving up on car transport for this cycle, proceeding to travel-back');
+          state.carsTransportedForThisTravelBack = true;
+          state.pendingCarTransport = false;
+          saveState();
+          return;
+        }
+        // Fall through below now that hotCity is known - next tick will
+        // navigate to the garage since getCurrentPage() !== 'garage' yet.
+      } else {
+        updateStatus('Checking hot city before transporting cars...');
+        safeNavigate('/authenticated/travel.aspx?' + Date.now());
+        return;
+      }
+    }
+
+    if (getCurrentPage() !== 'garage') {
+      updateStatus('Navigating to garage to transport cars to hot city...');
+      safeNavigate('/authenticated/playerproperty.aspx?p=g&' + Date.now());
+      return;
+    }
+
+    const targetId = CAR_TRANSPORT_CITY_IDS[hotCity.trim().toLowerCase()];
+    if (!targetId) {
+      console.warn(`[TMN][CAR-TRANSPORT] No known city-id mapping for hot city "${hotCity}" - skipping transport, flying back without moving cars`);
+      updateStatus(`Car transport: unknown city "${hotCity}" - skipped`);
+      state.carsTransportedForThisTravelBack = true;
+      state.pendingCarTransport = false;
+      saveState();
+      return;
+    }
+
+    const table = document.getElementById('ctl00_main_gvCars');
+    const rows = table ? Array.from(table.querySelectorAll('tr')).slice(1) : [];
+    const carRows = rows.filter(row => row.querySelector('input[type="checkbox"]'));
+
+    if (carRows.length === 0) {
+      console.log('[TMN][CAR-TRANSPORT] No cars in garage - nothing to transport');
+      state.carsTransportedForThisTravelBack = true;
+      state.pendingCarTransport = false;
+      saveState();
+      return;
+    }
+
+    const select = document.getElementById('ctl00_main_ddlCities');
+    const transportBtn = document.getElementById('ctl00_main_btnTransport');
+    if (!select || !transportBtn) {
+      console.warn('[TMN][CAR-TRANSPORT] Transport dropdown or button not found - skipping transport, flying back without moving cars');
+      state.carsTransportedForThisTravelBack = true;
+      state.pendingCarTransport = false;
+      saveState();
+      return;
+    }
+
+    state.isPerformingAction = true;
+    state.currentAction = 'carTransport';
+    GM_setValue('actionStartTime', Date.now());
+    saveState();
+
+    console.log(`[TMN][CAR-TRANSPORT] Selecting all ${carRows.length} garage car(s) and transporting to hot city (${hotCity})`);
+    scheduleOCDTMAction(`🚗 Transporting ${carRows.length} car(s) to hot city (${hotCity})`, () => {
+      carRows.forEach(row => {
+        const cb = row.querySelector('input[type="checkbox"]');
+        if (cb) cb.checked = true;
+      });
+      select.value = targetId;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      transportBtn.click();
+
+      state.carsTransportedForThisTravelBack = true;
+      state.pendingCarTransport = false;
+      state.isPerformingAction = false;
+      state.currentAction = '';
+      state.lastCarTransport = Date.now();
+      GM_setValue('actionStartTime', 0);
+      saveState();
+      updateStatus(`✅ Transported ${carRows.length} car(s) to hot city (${hotCity})`);
+      sendTelegramMessage(
+        '🚗 <b>Cars Transported to Hot City</b>\n\n' +
+        `Player: ${state.playerName || 'Unknown'}\n` +
+        `Destination: ${hotCity}\n` +
+        `Cars: ${carRows.length}\n` +
+        'Flying back next.'
+      );
+    });
   }
 
   // ---------------------------
@@ -7601,7 +8052,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.46</strong>
+          <strong>TMN TDS Auto v17.56</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -7706,9 +8157,15 @@ let logoutNotificationSent = false;
                 <span id="tmn-dtm-timer" style="font-weight: 500;">${cachedDisplayValues.dtm || '<span style="color:#9ca3af;">●</span> --'}</span>
               </div>
             </div>
-            <div class="d-flex align-items-center">
-              <span style="color:#9ca3af; width: 55px;">Prot:</span>
-              <span id="tmn-protection-timer" style="font-weight: 500;">${cachedDisplayValues.protection || '<span style="color:#9ca3af;">●</span> --'}</span>
+            <div class="d-flex justify-content-between align-items-center">
+              <div class="d-flex align-items-center" style="width: 50%;">
+                <span style="color:#9ca3af; width: 55px;">Prot:</span>
+                <span id="tmn-protection-timer" style="font-weight: 500;">${cachedDisplayValues.protection || '<span style="color:#9ca3af;">●</span> --'}</span>
+              </div>
+              <div class="form-check form-switch" style="width: 50%; display:flex; align-items:center; margin:0; padding-top:0; padding-bottom:0;">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-login-submit" style="margin-top:0 !important; margin-bottom:0 !important;">
+                <label class="form-check-label" for="tmn-auto-login-submit" style="margin-top:0; margin-bottom:0; margin-left:8px; line-height:1.2;" title="Automatically submits the login form once a captcha token is detected, instead of requiring you to click Login yourself. Same setting as &quot;Auto-submit after captcha&quot; in Settings - toggling either one updates both.">Auto Login</label>
+              </div>
             </div>
           </div>
         </div>
@@ -8388,7 +8845,9 @@ let logoutNotificationSent = false;
         state.pendingTravelBack = false;
         state.travelBackInProgress = false;
         state.travelBackQueuedAt = 0;
+        state.pendingCarTransport = false;
         GM_setValue('travelBackStartedAt', 0);
+        GM_setValue('carTransportStartedAt', 0);
       }
       saveState();
       updateStatus('🛫 Auto Travel ' + (state.autoTravelAfterDTM ? 'Enabled' : 'Disabled'));
@@ -9122,7 +9581,25 @@ let logoutNotificationSent = false;
     shadowRoot.querySelector("#tmn-auto-submit-enabled").addEventListener('change', e => {
   LOGIN_CONFIG.AUTO_SUBMIT_ENABLED = e.target.checked;
   GM_setValue('autoSubmitEnabled', LOGIN_CONFIG.AUTO_SUBMIT_ENABLED);
+  // Keep the main-panel "Auto Login" switch in sync - same underlying
+  // setting, shown in two places (both always in the DOM at once, since
+  // the Settings modal is just hidden/shown via a class, not
+  // created/destroyed).
+  const mainPanelCb = shadowRoot.querySelector("#tmn-auto-login-submit");
+  if (mainPanelCb) mainPanelCb.checked = LOGIN_CONFIG.AUTO_SUBMIT_ENABLED;
 });
+
+    // Main-panel "Auto Login" switch - same LOGIN_CONFIG.AUTO_SUBMIT_ENABLED
+    // setting as "Auto-submit after captcha" above, just surfaced as a
+    // regular switch alongside the other Auto toggles for convenience.
+    shadowRoot.querySelector("#tmn-auto-login-submit").checked = LOGIN_CONFIG.AUTO_SUBMIT_ENABLED;
+    shadowRoot.querySelector("#tmn-auto-login-submit").addEventListener('change', e => {
+      LOGIN_CONFIG.AUTO_SUBMIT_ENABLED = e.target.checked;
+      GM_setValue('autoSubmitEnabled', LOGIN_CONFIG.AUTO_SUBMIT_ENABLED);
+      updateStatus('Auto Login ' + (LOGIN_CONFIG.AUTO_SUBMIT_ENABLED ? 'Enabled' : 'Disabled'));
+      const settingsCb = shadowRoot.querySelector("#tmn-auto-submit-enabled");
+      if (settingsCb) settingsCb.checked = LOGIN_CONFIG.AUTO_SUBMIT_ENABLED;
+    });
 
     // Advanced Features Event Listeners
     shadowRoot.querySelector("#tmn-auto-resume-enabled").checked = autoResumeConfig.enabled;
@@ -9352,6 +9829,22 @@ let logoutNotificationSent = false;
   // Main Loop (WITH JAIL CHECKS ON EVERY PAGE)
   // ---------------------------
 async function mainLoop() {
+    // v17.51 - Top-level safety net. Previously nothing wrapped this entire
+    // ~700-line function - if ANY unexpected error was thrown anywhere in
+    // here (a DOM structure the site changed, a null reference, anything
+    // not already individually try/caught), it would propagate all the way
+    // up through this setTimeout-based callback uncaught. Since nothing
+    // downstream of the throw ever runs, none of mainLoop's own
+    // setTimeout(mainLoop, ...) reschedule calls would fire either - the
+    // entire recursive loop would die silently and permanently, with
+    // automation stopped until a manual page reload, and no error visible
+    // anywhere except the browser's own console. Given how much of this
+    // script depends on the live site's DOM staying exactly as expected,
+    // this was a standing risk for exactly the kind of "it just hangs"
+    // symptom seen earlier in this session (for different, now-fixed,
+    // reasons) - this catch-all guards against ANY future instance of that
+    // same failure class, known or not-yet-discovered.
+    try {
     // Tab Manager: STRICT single-tab enforcement
     // Always re-check master status to handle tab switches
     const wasMaster = tabManager.isMasterTab;
@@ -9794,7 +10287,9 @@ async function mainLoop() {
               state.travelBackInProgress = false;
               state.pendingTravelBack = false;
               state.travelBackQueuedAt = 0;
+              state.pendingCarTransport = false;
               GM_setValue('travelBackStartedAt', 0);
+              GM_setValue('carTransportStartedAt', 0);
               saveState();
               // Don't set travelBackHandledThisTick - fall through to normal
               // crime/GTA/etc handling now that the pause is cleared.
@@ -9809,16 +10304,52 @@ async function mainLoop() {
           } else if (state.autoTravelAfterDTM && state.pendingTravelBack) {
             const queuedAt = state.travelBackQueuedAt || 0;
             if (queuedAt && (now - queuedAt) >= TRAVEL_BACK_DELAY_MS) {
-              state.travelBackInProgress = true;
-              GM_setValue('travelBackStartedAt', now);
-              saveState();
-              if (currentPage === 'travel') {
-                doTravelBackToHotCity();
-              } else {
-                updateStatus("Navigating to Airport to travel back to hot city...");
-                safeNavigate('/authenticated/travel.aspx?' + Date.now());
+              // v17.46 - before flying back, make sure garage cars aren't
+              // left behind: if we're not currently in the hot city and
+              // haven't transported cars yet this travel-back cycle, do
+              // that first (garage page, "Transport selected cars to:").
+              // Keeps re-entering this branch tick after tick (e.g. while
+              // the garage page loads) until carsTransportedForThisTravelBack
+              // flips true, exactly like the queued-wait above does for jet
+              // travel.
+              if (!state.carsTransportedForThisTravelBack && !isInHotCity()) {
+                // v17.49 - watchdog mirroring travelBackInProgress's below:
+                // if car transport has been "in progress" for 90s+ without
+                // resolving (any cause, not just the specific dead-end just
+                // fixed above), give up on it rather than staying stuck
+                // here indefinitely and blocking every other action.
+                const carTransportStartedAt = GM_getValue('carTransportStartedAt', 0);
+                if (carTransportStartedAt && (now - carTransportStartedAt > 90000)) {
+                  console.warn('[TMN][CAR-TRANSPORT] Stuck for 90s+ - giving up on car transport, proceeding to travel-back');
+                  state.carsTransportedForThisTravelBack = true;
+                  state.pendingCarTransport = false;
+                  GM_setValue('carTransportStartedAt', 0);
+                  saveState();
+                  // Don't set travelBackHandledThisTick - let this same
+                  // tick fall through to the else branch below (jet travel)
+                  // now that the latch is set, instead of waiting a full
+                  // extra tick.
+                } else {
+                  if (!carTransportStartedAt) GM_setValue('carTransportStartedAt', now);
+                  state.pendingCarTransport = true;
+                  saveState();
+                  transportCarsToHotCity();
+                  travelBackHandledThisTick = true;
+                }
               }
-              travelBackHandledThisTick = true;
+              if (!travelBackHandledThisTick && (state.carsTransportedForThisTravelBack || isInHotCity())) {
+                GM_setValue('carTransportStartedAt', 0);
+                state.travelBackInProgress = true;
+                GM_setValue('travelBackStartedAt', now);
+                saveState();
+                if (currentPage === 'travel') {
+                  doTravelBackToHotCity();
+                } else {
+                  updateStatus("Navigating to Airport to travel back to hot city...");
+                  safeNavigate('/authenticated/travel.aspx?' + Date.now());
+                }
+                travelBackHandledThisTick = true;
+              }
             }
             // else: still waiting out the 22-minute delay - don't claim the
             // tick, let crime/GTA/etc proceed normally; we'll check again
@@ -9830,6 +10361,20 @@ async function mainLoop() {
         // Check if we have a pending action from being jailed
         if (state.pendingAction) {
           updateStatus(`Resuming pending action: ${state.pendingAction}`);
+          // v17.51 - every one of these three branches used to `return`
+          // with no setTimeout(mainLoop, ...) beforehand, UNLIKE every other
+          // early return in this whole function. That's harmless in the
+          // else/safeNavigate half (navigation reloads the page, which
+          // reinjects the script and restarts the chain from init()) but a
+          // real dead end in the if/currentPage-matches half: no reload
+          // happens there, so mainLoop's recursive setTimeout chain just
+          // stopped forever - all automation silently halted in that tab
+          // until a manual page refresh. Only reachable via a specific
+          // combination (released from jail while already sitting on the
+          // matching page with a pending action queued), which is likely
+          // why it went unnoticed. Added the same reschedule every other
+          // branch uses; harmless on the navigate side since a reload
+          // cancels the pending timer anyway.
           if (state.pendingAction === 'crime' && shouldDoCrime) {
             if (currentPage === 'crimes') {
               doCrime();
@@ -9837,6 +10382,7 @@ async function mainLoop() {
               updateStatus("Navigating to crimes page to resume pending action...");
               safeNavigate('/authenticated/crimes.aspx?' + Date.now());
             }
+            setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
           } else if (state.pendingAction === 'gta' && shouldDoGTA) {
             if (currentPage === 'gta') {
@@ -9845,6 +10391,7 @@ async function mainLoop() {
               updateStatus("Navigating to GTA page to resume pending action...");
               safeNavigate('/authenticated/crimes.aspx?p=g&' + Date.now());
             }
+            setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
           } else if (state.pendingAction === 'booze' && shouldDoBooze) {
             if (currentPage === 'booze') {
@@ -9853,6 +10400,7 @@ async function mainLoop() {
               updateStatus("Navigating to booze page to resume pending action...");
               safeNavigate('/authenticated/crimes.aspx?p=b&' + Date.now());
             }
+            setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
           } else {
             // Pending action no longer relevant
@@ -9949,6 +10497,21 @@ async function mainLoop() {
     }
 
     setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
+    } catch (err) {
+      // Something unexpected went wrong somewhere above - log it (so it's
+      // visible/debuggable) but always reschedule, exactly like every
+      // normal path through this function does. This is the one path that
+      // must never skip the reschedule, since there's no more specific
+      // handler left to fall back on. The inner try/catch around
+      // updateStatus is deliberate belt-and-braces: even if the recovery
+      // logging itself fails (e.g. the panel's DOM is in a bad state), the
+      // reschedule below must still happen unconditionally.
+      try {
+        console.error('[TMN] mainLoop hit an unexpected error - recovering and continuing:', err);
+        updateStatus('⚠️ Unexpected error - recovering automatically');
+      } catch (e2) {}
+      setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
+    }
   }
 
   // ---------------------------
@@ -9982,7 +10545,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.46 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.56 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
