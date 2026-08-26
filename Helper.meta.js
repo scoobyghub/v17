@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.46
+// @name         TMN TDS Auto v17.56
 // @namespace    http://tampermonkey.net/
-// @version      17.46
-// @description  v17.46 — Auto-login fix: don't require a captcha token when no captcha is rendered on the login page
+// @version      17.56
+// @description  v17.56 — Add "Auto Login" switch to the main panel (mirrors Settings' Auto-submit-after-captcha)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
