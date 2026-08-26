@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.20
+// @name         TMN TDS Auto v17.46
 // @namespace    http://tampermonkey.net/
-// @version      17.20
-// @description  v17.20 — fixes Telegram logout/timeout alerts on login.aspx?act=out and keeps v17.13 crusher flow
+// @version      17.46
+// @description  v17.46 — Auto-login fix: don't require a captcha token when no captcha is rendered on the login page
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -10,6 +10,8 @@
 // @match        *://www.tmn2010.net/Authenticated/*
 // @match        *://www.tmn2010.net/Default.aspx*
 // @match        *://www.tmn2010.net/default.aspx*
+// @match        *://www.tmn2010.net/Authenticated/Default.aspx*
+// @match        *https://www.tmn2010.net/authenticated/
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
