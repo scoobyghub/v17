@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.56
+// @name         TMN TDS Auto v17.58
 // @namespace    http://tampermonkey.net/
-// @version      17.56
-// @description  v17.56 — Add "Auto Login" switch to the main panel (mirrors Settings' Auto-submit-after-captcha)
+// @version      17.58
+// @description  v17.58 — Jail: dropped the redundant forced-reload-after-click (wastes time on a short cadence); corrected jailbreakInterval default back down to 4s per feedback (120s was wrong)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
