@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.56
+// @name         TMN TDS Auto v17.58
 // @namespace    http://tampermonkey.net/
-// @version      17.56
-// @description  v17.56 — Add "Auto Login" switch to the main panel (mirrors Settings' Auto-submit-after-captcha)
+// @version      17.58
+// @description  v17.58 — Jail: dropped the redundant forced-reload-after-click (wastes time on a short cadence); corrected jailbreakInterval default back down to 4s per feedback (120s was wrong)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -22,6 +22,73 @@
 // ==/UserScript==
 
 /*
+TMN TDS Auto v17.58 — changelog
+
+Follow-up correction based on direct feedback on v17.57's jail changes.
+
+FIX IN v17.58:
+- Removed the needsRefresh-triggered forced reload added in v17.57.
+  Jailbreak sets that flag after every successful click and, on the next
+  entry, was forcing an extra navigation to jail.aspx on top of whatever
+  reload the click's own postback already did. With a 120s+ cooldown that
+  extra round-trip was negligible; with jail's actually-intended ~4s
+  cadence (see below) it would double navigation overhead on every single
+  cycle, working directly against the point of checking quickly. Jail now
+  only navigates when it's not actually on the jail page at all - no flag,
+  no double reload.
+- jailbreakInterval's default is back down to 4s (was bumped to 120s in
+  v17.57 on the mistaken assumption it should match crime/GTA/booze's
+  multi-minute cooldowns). Per feedback, jail's short cadence is
+  intentional: bailing other players out isn't gated by an energy/nerve-
+  style server-side cost the way crime/GTA/booze are, so checking
+  frequently is correct, not a bug. Installs that picked up the brief
+  120s default get migrated down to 4s automatically; anyone still on the
+  original pre-v17.57 value of 3s (or any other custom value) is left
+  alone.
+
+--- v17.57 changelog below ---
+
+TMN TDS Auto v17.57 — changelog
+
+Investigated a report that Auto Jail "doesn't seem to be working very well."
+
+FIX IN v17.57:
+- jailbreakInterval (the cooldown between jailbreak attempts) defaulted to
+  3 seconds - compare crimeInterval's 125, gtaInterval's 245, and
+  boozeInterval's 120. Three orders of magnitude shorter than every other
+  action's cooldown, and shorter than mainLoop's own ~1.8-3.2s tick
+  interval. Since jailbreak sits at the lowest priority in mainLoop's
+  action-selection chain (only runs when crime/GTA/booze are all not due),
+  this near-zero cooldown meant it was effectively unthrottled: it fired
+  on almost every idle tick, constantly bouncing to the jail page even
+  when there was nothing to bail out, instead of settling into a cadence
+  like the other three. Default bumped to 120s (matching booze). Existing
+  installs that already saved the old 3s default get migrated to 120s
+  automatically the first time this version loads (anyone who deliberately
+  set a different custom value, including coincidentally 3, is unaffected
+  either way, since the migration only triggers on an exact match against
+  the specific old buggy default).
+- doJailbreak() explicitly forced a re-navigation to jail.aspx via
+  safeNavigate() a fixed 1.1-1.9s after clicking a break link, regardless
+  of whether the click's own postback had actually finished. If the server
+  hadn't responded yet, that forced navigation could cancel the in-flight
+  postback outright - the attempt would get logged as "attempted" client-
+  side while the actual bail-out may never have completed server-side.
+  doCrime() doesn't fight its own postback this way - it just sets
+  needsRefresh and lets the click's natural reload happen, with the flag
+  as a fallback in case it didn't. doJailbreak() now follows the same
+  pattern (also gained the needsRefresh-checking reload gate on entry that
+  doCrime() already had).
+- Jailbreak was entirely missing from the pendingAction resume-after-jail-
+  release mechanism that crime/GTA/booze already had (added in v17.51).
+  Getting jailed mid-attempt did correctly set state.pendingAction =
+  'jailbreak' (via the same generic handler that does this for whatever
+  action was running), but with no matching branch in the resume block, it
+  silently fell through to "no longer relevant" and got discarded instead
+  of resumed - unlike the other three. Added the matching branch.
+
+--- v17.56 changelog below ---
+
 TMN TDS Auto v17.56 — changelog
 
 FIX IN v17.56:
@@ -1158,7 +1225,7 @@ No changes intended to bypass site detection or restrictions; reliability/load c
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.56\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.58\n${message}`;
     }
 
     function clearTimers() {
@@ -1428,7 +1495,14 @@ if (currentPath.includes("/authenticated/")) {
   const config = {
     crimeInterval: GM_getValue('crimeInterval', 125),
     gtaInterval: GM_getValue('gtaInterval', 245),
-    jailbreakInterval: GM_getValue('jailbreakInterval', 3),
+    // v17.58 - was 3s in earlier versions, briefly "fixed" to 120s in
+    // v17.57 on the (wrong) assumption it should match crime/GTA/booze's
+    // multi-minute cooldowns. Corrected per direct feedback: jail's short
+    // cadence is intentional, not a bug - bailing other players out isn't
+    // gated by an energy/nerve-style server-side cost the way crime/GTA/
+    // booze are, so checking frequently is the actual desired behavior.
+    // Settled on 4s (up slightly from the original 3s default).
+    jailbreakInterval: GM_getValue('jailbreakInterval', 4),
     jailCheckInterval: GM_getValue('jailCheckInterval', 5),
     boozeInterval: GM_getValue('boozeInterval', 120),
     boozeBuyAmount: GM_getValue('boozeBuyAmount', 5),
@@ -1448,6 +1522,18 @@ if (currentPath.includes("/authenticated/")) {
     minHealthThreshold: GM_getValue('minHealthThreshold', 90),
     targetHealth: GM_getValue('targetHealth', 100)
   };
+
+  // v17.58 - Migration for installs that picked up the brief v17.57 bump to
+  // 120s. That was based on a mistaken assumption (see comment above) and
+  // is being reverted; anyone sitting on that now-also-wrong 120s value
+  // gets moved to the real default of 4s. Installs still on the original
+  // 3s (from before v17.57 ever ran) or any other custom value are left
+  // alone - only the specific v17.57 value gets corrected.
+  if (config.jailbreakInterval === 120) {
+    console.log('[TMN] Migrating jailbreakInterval from the brief v17.57 default (120s) to 4s');
+    config.jailbreakInterval = 4;
+    GM_setValue('jailbreakInterval', 4);
+  }
 
   // ---------------------------
   // Human-like Delays (anti-detection)
@@ -5932,6 +6018,14 @@ let logoutNotificationSent = false;
     const now = Date.now();
     if (now - state.lastJail < config.jailbreakInterval * 1000) return;
 
+    // v17.58 - dropped the needsRefresh-triggered forced reload added in
+    // v17.57. That flag gets set to true after every successful click (see
+    // below) - with a 120s+ cooldown a follow-up forced reload on the next
+    // entry was a rounding error, but now that the cooldown is intentionally
+    // just 4s, forcing an extra reload on top of the click's own natural
+    // postback reload every single cycle would double navigation overhead
+    // right when the whole point is to check as fast as possible. Only
+    // navigate if we're not actually on the jail page at all.
     if (getCurrentPage() !== 'jail') {
       updateStatus("Navigating to jail page...");
       safeNavigate('/authenticated/jail.aspx?' + Date.now());
@@ -5952,13 +6046,23 @@ let logoutNotificationSent = false;
       updateStatus(`Jailbreak attempted (${availableLinks.length} available)`);
 
       state.lastJail = now;
+      // v17.57 - was explicitly force-navigating back to jail.aspx via
+      // safeNavigate() a fixed 1.1-1.9s after the click, regardless of
+      // whether the click's own __doPostBack had actually finished. If the
+      // server hadn't responded yet, that forced navigation could cancel
+      // the in-flight postback outright - the click would be logged as
+      // "attempted" but the actual bail-out might never complete
+      // server-side. Just letting the click's natural postback reload
+      // happen on its own, with no explicit follow-up action needed here -
+      // v17.58 also dropped the needsRefresh fallback flag itself (see
+      // above), since with a 4s cooldown any lingering staleness gets
+      // caught by the next cycle anyway.
       saveState();
 
       setTimeout(() => {
         state.isPerformingAction = false;
         state.currentAction = '';
         GM_setValue('actionStartTime', 0);
-        safeNavigate('/authenticated/jail.aspx?' + Date.now());
       }, randomDelay(DELAYS.quick));
     } else {
       state.lastJail = now;
@@ -8052,7 +8156,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.56</strong>
+          <strong>TMN TDS Auto v17.58</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -10402,6 +10506,26 @@ async function mainLoop() {
             }
             setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
+          } else if (state.pendingAction === 'jailbreak' && shouldDoJailbreak) {
+            // v17.57 - jailbreak was entirely missing from this resume
+            // mechanism. state.currentAction is set to 'jailbreak' while an
+            // attempt is in flight (see doJailbreak), so getting jailed
+            // mid-attempt did correctly populate state.pendingAction =
+            // 'jailbreak' via the generic handler that does that for
+            // whatever action was running - but with no matching branch
+            // here, it always fell through to the else below and got
+            // silently discarded instead of resumed, unlike crime/gta/
+            // booze. Low severity on its own (the interval gate lets a new
+            // attempt fire soon anyway), but inconsistent with the other
+            // three and worth fixing for the same reason they were.
+            if (currentPage === 'jail') {
+              doJailbreak();
+            } else {
+              updateStatus("Navigating to jail page to resume pending action...");
+              safeNavigate('/authenticated/jail.aspx?' + Date.now());
+            }
+            setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
+            return;
           } else {
             // Pending action no longer relevant
             state.pendingAction = '';
@@ -10545,7 +10669,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.56 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.58 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
