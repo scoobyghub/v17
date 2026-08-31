@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.58
+// @name         TMN TDS Auto v17.59
 // @namespace    http://tampermonkey.net/
-// @version      17.58
-// @description  v17.58 — Jail: dropped the redundant forced-reload-after-click (wastes time on a short cadence); corrected jailbreakInterval default back down to 4s per feedback (120s was wrong)
+// @version      17.59
+// @description  v17.59 — Fix: pendingAction resume could get permanently stuck on jailbreak, completely blocking crime/GTA/booze from ever running again
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
