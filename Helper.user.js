@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.58
+// @name         TMN TDS Auto v17.59
 // @namespace    http://tampermonkey.net/
-// @version      17.58
-// @description  v17.58 — Jail: dropped the redundant forced-reload-after-click (wastes time on a short cadence); corrected jailbreakInterval default back down to 4s per feedback (120s was wrong)
+// @version      17.59
+// @description  v17.59 — Fix: pendingAction resume could get permanently stuck on jailbreak, completely blocking crime/GTA/booze from ever running again
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -22,6 +22,44 @@
 // ==/UserScript==
 
 /*
+TMN TDS Auto v17.59 — changelog
+
+Investigated a report that after v17.58's jail-interval change, the script
+"carries on jailbreaking and does not run the main crime/gta/booze loop
+when before the loop was priority."
+
+FIX IN v17.59:
+- Real bug, and a significant one: the pendingAction resume mechanism
+  (added in v17.51 for crime/GTA/booze, extended to jailbreak in v17.57)
+  never checked whether a HIGHER-priority action was also currently due -
+  each branch only asked "does this match the pending action, and is ITS
+  OWN cooldown up," completely independent of the others. That was
+  survivable for GTA/booze in practice only because their cooldowns
+  (245s/120s) are so much longer than mainLoop's ~1.8-3.2s tick that the
+  fallthrough-clear (the final `else { pendingAction = '' }`) almost always
+  got a chance to fire soon after one resume attempt, unsticking things
+  before it became visible. Jailbreak's cooldown is 4s - comparable to the
+  tick interval itself - so once state.pendingAction became 'jailbreak'
+  (which happens far more easily now than before, simply because jailbreak
+  fires so much more often than crime/GTA/booze), shouldDoJailbreak
+  essentially never went false long enough for that fallthrough-clear to
+  ever run. pendingAction got stuck on 'jailbreak' PERMANENTLY, and this
+  block - which never even looks at crime/GTA/booze once locked onto
+  resuming jailbreak - silently consumed every single tick from then on,
+  completely bypassing the real priority-selection logic further down
+  where crime/GTA/booze normally get their turn. Exactly the reported
+  symptom.
+- Fixed by making the resume branches defer to the same priority order the
+  selection logic below already uses (gta requires !shouldDoCrime, booze
+  requires !shouldDoCrime && !shouldDoGTA, jailbreak requires none of the
+  three above it to be due). The instant something higher-priority becomes
+  due, none of the specific branches match anymore, pendingAction gets
+  cleared via the final else, and control falls straight through to normal
+  priority selection in the very same tick - permanently unstuck, not just
+  delayed a few seconds.
+
+--- v17.58 changelog below ---
+
 TMN TDS Auto v17.58 — changelog
 
 Follow-up correction based on direct feedback on v17.57's jail changes.
@@ -1225,7 +1263,7 @@ No changes intended to bypass site detection or restrictions; reliability/load c
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.58\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.59\n${message}`;
     }
 
     function clearTimers() {
@@ -8156,7 +8194,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.58</strong>
+          <strong>TMN TDS Auto v17.59</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -10488,7 +10526,32 @@ async function mainLoop() {
             }
             setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
-          } else if (state.pendingAction === 'gta' && shouldDoGTA) {
+          // v17.59 - added "!shouldDoCrime" (and the equivalent guards
+          // below) to every lower-priority branch. Before this, resuming a
+          // pending action ignored whether a HIGHER-priority action was
+          // ALSO currently due - it only ever checked whether ITS OWN
+          // cooldown and the matching pendingAction happened to line up.
+          // That was survivable for gta/booze in practice only because
+          // their cooldowns (245s/120s) are so much longer than mainLoop's
+          // ~1.8-3.2s tick that the fallthrough-clear below almost always
+          // got a chance to fire soon after one resume attempt, unsticking
+          // things. Jailbreak's cooldown is 4s - comparable to the tick
+          // interval itself - so shouldDoJailbreak essentially never went
+          // false long enough for that fallthrough-clear to ever run once
+          // pendingAction became 'jailbreak': it got stuck there
+          // PERMANENTLY, and this whole block - which never even looks at
+          // crime/GTA/booze once locked onto resuming jailbreak - silently
+          // ate every single tick from then on, completely bypassing the
+          // real priority-selection logic further down where crime/GTA/
+          // booze normally get their turn. That's the "stopped running the
+          // main loop, just keeps jailbreaking" bug. These guards make the
+          // resume mechanism defer to the same priority order the
+          // selection logic below already uses: the instant something
+          // higher-priority is due, none of the specific branches match
+          // anymore, so pendingAction gets cleared via the final else and
+          // control falls straight through to normal priority selection in
+          // the very same tick - permanently unstuck, not just delayed.
+          } else if (state.pendingAction === 'gta' && shouldDoGTA && !shouldDoCrime) {
             if (currentPage === 'gta') {
               doGTA();
             } else {
@@ -10497,7 +10560,7 @@ async function mainLoop() {
             }
             setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
-          } else if (state.pendingAction === 'booze' && shouldDoBooze) {
+          } else if (state.pendingAction === 'booze' && shouldDoBooze && !shouldDoCrime && !shouldDoGTA) {
             if (currentPage === 'booze') {
               doBooze();
             } else {
@@ -10506,18 +10569,7 @@ async function mainLoop() {
             }
             setTimeout(mainLoop, 1800 + Math.floor(Math.random() * 1400));
             return;
-          } else if (state.pendingAction === 'jailbreak' && shouldDoJailbreak) {
-            // v17.57 - jailbreak was entirely missing from this resume
-            // mechanism. state.currentAction is set to 'jailbreak' while an
-            // attempt is in flight (see doJailbreak), so getting jailed
-            // mid-attempt did correctly populate state.pendingAction =
-            // 'jailbreak' via the generic handler that does that for
-            // whatever action was running - but with no matching branch
-            // here, it always fell through to the else below and got
-            // silently discarded instead of resumed, unlike crime/gta/
-            // booze. Low severity on its own (the interval gate lets a new
-            // attempt fire soon anyway), but inconsistent with the other
-            // three and worth fixing for the same reason they were.
+          } else if (state.pendingAction === 'jailbreak' && shouldDoJailbreak && !shouldDoCrime && !shouldDoGTA && !shouldDoBooze) {
             if (currentPage === 'jail') {
               doJailbreak();
             } else {
@@ -10669,7 +10721,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.58 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.59 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
