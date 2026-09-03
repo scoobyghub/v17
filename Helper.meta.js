@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.59
+// @name         TMN TDS Auto v17.60
 // @namespace    http://tampermonkey.net/
-// @version      17.59
-// @description  v17.59 — Fix: pendingAction resume could get permanently stuck on jailbreak, completely blocking crime/GTA/booze from ever running again
+// @version      17.60
+// @description  v17.60 — New: OC Classifieds Auto-Add (Settings only)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
