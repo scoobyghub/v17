@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         TMN TDS Auto v17.59
+// @name         TMN TDS Auto v17.60
 // @namespace    http://tampermonkey.net/
-// @version      17.59
-// @description  v17.59 — Fix: pendingAction resume could get permanently stuck on jailbreak, completely blocking crime/GTA/booze from ever running again
+// @version      17.60
+// @description  v17.60 — New: OC Classifieds Auto-Add (Settings only)
 // @author       You
 // @match        *://www.tmn2010.net/login.aspx*
 // @match        *://www.tmn2010.net/authenticated/*
@@ -22,6 +22,42 @@
 // ==/UserScript==
 
 /*
+TMN TDS Auto v17.60 — changelog
+
+NEW IN v17.60:
+- OC Classifieds Auto-Add, a new Settings-only toggle: 90 seconds after OC
+  becomes ready, clicks Add me! on the OC Classifieds page (ocads.aspx).
+  Reuses the same OC-readiness signal that drives the existing OC/DTM
+  Telegram alerts, but tracked independently - the alert function returns
+  immediately whenever Telegram isn't configured, so this needed its own
+  edge-detection rather than piggybacking on that one. Wired into mainLoop
+  with the same "in-progress + 90s watchdog" pattern bunker/scrapyard
+  already use, placed in the same low-priority tier so it never preempts
+  crime/GTA/
+  booze/jailbreak.
+
+FIX (same version, UI placement corrected after initial release): the
+Auto-Add OC Classifieds checkbox was mistakenly placed in the main panel's
+own switches grid rather than the Settings modal - a misread of the file's
+structure (the checkbox grid it landed in and the actual Settings modal
+are both children of the same wrapper, and it's easy to mistake one for
+the other at a glance). Moved into Settings, under a new "OC Classifieds"
+section, right after Jailbreak Options. The main panel is now back to
+exactly its v17.59 layout. No behavior changed - same element id, same
+init/listener wiring, just relocated in the HTML.
+
+FIX (same version, added hot-city requirement): OC Classifieds Auto-Add
+now also requires isInHotCity() before it'll click Add me!, per request.
+Folded directly into the ocAddDue condition in mainLoop rather than
+checked only after already navigating to ocads.aspx - if you're not in
+the hot city yet, ocAddDue is simply false, so this feature doesn't
+navigate anywhere or claim the tick at all, and crime/GTA/booze/jailbreak
+keep running normally while waiting. A second, redundant check inside
+doOCAdsSubmit() itself guards against clicking even if somehow reached
+without that condition holding.
+
+--- v17.59 changelog below ---
+
 TMN TDS Auto v17.59 — changelog
 
 Investigated a report that after v17.58's jail-interval change, the script
@@ -1263,7 +1299,7 @@ No changes intended to bypass site detection or restrictions; reliability/load c
         document.body.appendChild(loginOverlay);
       }
       console.log("[TMN AutoLogin]", message);
-      loginOverlay.textContent = `TMN TDS AutoLogin v17.59\n${message}`;
+      loginOverlay.textContent = `TMN TDS AutoLogin v17.60\n${message}`;
     }
 
     function clearTimers() {
@@ -1809,6 +1845,14 @@ if (currentPath.includes("/authenticated/")) {
     autoOC: GM_getValue('autoOC', false),
     autoDTM: GM_getValue('autoDTM', false),
     notifyOCDTMReady: GM_getValue('notifyOCDTMReady', true),
+    // v17.60 - OC Classifieds auto-add: fires 90s after OC becomes ready
+    // (reuses the same readiness signal notifyOCDTMReady's alerts already
+    // use), then clicks a button on the ocads.aspx page.
+    // ocReadyForAddAt/ocAddedThisCycle track the OC timer for this.
+    autoAddOC: GM_getValue('autoAddOC', false),
+    ocReadyForAddAt: GM_getValue('ocReadyForAddAt', 0),
+    ocAddedThisCycle: GM_getValue('ocAddedThisCycle', false),
+    ocAdsCheckInProgress: GM_getValue('ocAdsCheckInProgress', false),
     whitelistEnabled: GM_getValue('whitelistEnabled', false),
     whitelistNames: GM_getValue('whitelistNames', []),
     carCategories: GM_getValue('carCategories', {}),
@@ -1879,6 +1923,10 @@ if (currentPath.includes("/authenticated/")) {
     GM_setValue('autoOC', state.autoOC);
     GM_setValue('autoDTM', state.autoDTM);
     GM_setValue('notifyOCDTMReady', state.notifyOCDTMReady);
+    GM_setValue('autoAddOC', state.autoAddOC);
+    GM_setValue('ocReadyForAddAt', state.ocReadyForAddAt);
+    GM_setValue('ocAddedThisCycle', state.ocAddedThisCycle);
+    GM_setValue('ocAdsCheckInProgress', state.ocAdsCheckInProgress);
     GM_setValue('whitelistEnabled', state.whitelistEnabled);
     GM_setValue('whitelistNames', state.whitelistNames);
     GM_setValue('carCategories', state.carCategories);
@@ -2064,7 +2112,7 @@ if (currentPath.includes("/authenticated/")) {
         'autoCrime', 'autoGTA', 'autoJail', 'autoBooze', 'lastCrime', 'lastGTA', 'lastJail', 'lastBooze',
         'selectedCrimes', 'selectedGTAs', 'playerName', 'inJail', 'crimeCollapsed', 'gtaCollapsed',
         'boozeCollapsed', 'panelMinimized', 'lastJailCheck', 'currentAction', 'needsRefresh', 'pendingAction',
-        'autoOC', 'autoDTM',
+        'autoOC', 'autoDTM', 'autoAddOC', 'ocReadyForAddAt', 'ocAddedThisCycle', 'ocAdsCheckInProgress',
         'lastStaffScriptMailId', 'lastScriptTestMailId', 'lastNotifiedMailId', 'notifyStaffMailCheck', 'notifyInboxScriptTest',
         'autoBunker', 'lastBunkerCheck', 'bunkerCheckInProgress',
         'autoBunkerExtend', 'bunkerExtendPending', 'bunkerExpiresAt',
@@ -3492,6 +3540,7 @@ let logoutNotificationSent = false;
 
     // Check if OC/DTM just became ready and send Telegram alert
     try { checkOCDTMReadyAlerts(); } catch (e) {}
+    try { checkOCAutoAddTrigger(); } catch (e) {}
   }
 
   function getHealthColor(healthPercent) {
@@ -3865,6 +3914,40 @@ let logoutNotificationSent = false;
       } else if (!ocReady && lastState === 'ready') {
         localStorage.setItem('tmnOCReadyAlertState', 'cooldown');
       }
+    }
+  }
+
+  // ---------------------------
+  // OC Classifieds Auto-Add trigger (v17.60)
+  // ---------------------------
+  // Deliberately separate from checkOCDTMReadyAlerts() above, which only
+  // ever runs when Telegram is configured (it returns immediately
+  // otherwise) - auto-adding to the OC classifieds needs to work whether
+  // or not Telegram alerts are set up at all, so this tracks the same OC
+  // readiness signal independently, with its own edge-detection state.
+  function checkOCAutoAddTrigger() {
+    if (!state.autoAddOC || state.inJail) return;
+
+    const ocStatus = getOCTimerStatus();
+    if (!ocStatus) return;
+    const ocReady = ocStatus.canOC === true || (ocStatus.totalSeconds || 0) <= 0;
+    const lastState = localStorage.getItem('tmnOCReadyForAddState');
+
+    if (ocReady && lastState !== 'ready') {
+      localStorage.setItem('tmnOCReadyForAddState', 'ready');
+      // Start (or restart) the 90s countdown for this readiness cycle.
+      state.ocReadyForAddAt = Date.now();
+      state.ocAddedThisCycle = false;
+      saveState();
+      console.log('[TMN][OCAdd] OC just became ready - will add to classifieds in 90s');
+    } else if (!ocReady && lastState === 'ready') {
+      localStorage.setItem('tmnOCReadyForAddState', 'cooldown');
+      // OC went back on cooldown (presumably because it got done) - reset
+      // for next time, so a stale 90s-old timestamp can't cause an
+      // immediate re-add the instant it becomes ready again.
+      state.ocReadyForAddAt = 0;
+      state.ocAddedThisCycle = false;
+      saveState();
     }
   }
 
@@ -5454,6 +5537,7 @@ let logoutNotificationSent = false;
     if (path.includes('travel.aspx')) return 'travel';
     if (path.includes('store.aspx') && search.includes('p=b')) return 'store';
     if (path.includes('store.aspx') && search.includes('p=s')) return 'scrapyard';
+    if (path.includes('ocads.aspx')) return 'ocads';
     if (path.includes('mailbox.aspx')) return 'mailbox';
     return 'other';
   }
@@ -7202,6 +7286,56 @@ let logoutNotificationSent = false;
     );
   }
 
+  // ---------------------------
+  // OC Classifieds Auto-Add (v17.60)
+  // ---------------------------
+  function doOCAdsSubmit() {
+    if (state.isPerformingAction || state.inJail || automationPaused) return;
+
+    if (getCurrentPage() !== 'ocads') {
+      updateStatus("Navigating to OC Classifieds...");
+      safeNavigate('/authenticated/ocads.aspx?' + Date.now());
+      return;
+    }
+
+    const ocDue = state.autoAddOC && state.ocReadyForAddAt > 0 && !state.ocAddedThisCycle &&
+      (Date.now() - state.ocReadyForAddAt >= 90000);
+
+    // v17.60 - Require being in the hot city before adding to the OC
+    // classifieds. Checked here too (not just in mainLoop's ocAddDue gate
+    // below) as defense-in-depth: this function could in principle be
+    // reached with a stale ocAddDue snapshot, and this guard makes it
+    // impossible to click the button while not in the hot city regardless
+    // of how it got here.
+    if (ocDue && !isInHotCity()) {
+      console.log('[TMN][OCAdd] OC add is due but not in hot city yet - waiting');
+      state.ocAdsCheckInProgress = false;
+      GM_setValue('ocAdsCheckStartedAt', 0);
+      saveState();
+      return;
+    }
+
+    if (ocDue) {
+      const btn = document.getElementById('ctl00_main_btnAddOC');
+      if (!btn) {
+        // Page may just not have finished loading yet - stay "in progress"
+        // and retry next tick without re-navigating (we're already here).
+        // The 90s stuck-watchdog in mainLoop covers a genuine, lasting
+        // problem (e.g. already added, button legitimately gone).
+        console.log('[TMN][OCAdd] btnAddOC not found yet on ocads page - will retry');
+        return;
+      }
+      btn.click();
+      state.ocAddedThisCycle = true;
+      updateStatus('✅ Added to OC Classifieds');
+      console.log('[TMN][OCAdd] Clicked Add me! for OC classifieds');
+    }
+
+    state.ocAdsCheckInProgress = false;
+    GM_setValue('ocAdsCheckStartedAt', 0);
+    saveState();
+  }
+
   // Hoisted to module scope (v17.45) so both mainLoop's gating and
   // checkHotCitySafetyNet below can reference the same constant.
   const TRAVEL_BACK_DELAY_MS = 22 * 60 * 1000;
@@ -8194,7 +8328,7 @@ let logoutNotificationSent = false;
     wrapper.innerHTML = `
       <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center" id="tmn-drag-handle" style="cursor: grab;">
-          <strong>TMN TDS Auto v17.59</strong>
+          <strong>TMN TDS Auto v17.60</strong>
           <div>
             <button id="tmn-lock-btn" class="btn btn-sm btn-outline-secondary me-1" title="Lock/Unlock position">ð</button>
             <button id="tmn-settings-btn" class="btn btn-sm btn-outline-secondary me-1" title="Settings">
@@ -8384,6 +8518,14 @@ let logoutNotificationSent = false;
                 <label class="form-label">Interval (sec):
                   <input type="number" id="tmn-jail-interval" class="form-control form-control-sm tmn-compact-input" value="${config.jailbreakInterval}" min="1" max="999">
                 </label>
+              </div>
+
+              <hr style="border-color:#1f2937">
+
+              <h6 style="color:#cbd5e1;">OC Classifieds</h6>
+              <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="tmn-auto-add-oc">
+                <label class="form-check-label" for="tmn-auto-add-oc" title="90 seconds after OC becomes ready, automatically clicks Add me! on the OC Classifieds page (ocads.aspx).">📋 Auto-Add OC Classifieds</label>
               </div>
 
               <hr style="border-color:#1f2937">
@@ -8813,6 +8955,7 @@ let logoutNotificationSent = false;
     shadowRoot.querySelector("#tmn-auto-dtm").checked = state.autoDTM;
     shadowRoot.querySelector("#tmn-auto-travel-back").checked = state.autoTravelAfterDTM;
     shadowRoot.querySelector("#tmn-notify-ocdtm-ready").checked = state.notifyOCDTMReady;
+    shadowRoot.querySelector("#tmn-auto-add-oc").checked = state.autoAddOC;
 
     // Initialize ALL ON/OFF toggle
     const allToggle = shadowRoot.querySelector("#tmn-auto-all");
@@ -9125,6 +9268,22 @@ let logoutNotificationSent = false;
         localStorage.removeItem('tmnDTMReadyAlertState');
         localStorage.removeItem('tmnOCReadyAlertState');
       }
+    });
+
+    shadowRoot.querySelector("#tmn-auto-add-oc").addEventListener('change', e => {
+      state.autoAddOC = e.target.checked;
+      if (e.target.checked) {
+        // v17.60 - Re-arm from scratch on enable, so a stale ready-state
+        // captured while this was off doesn't cause an unexpectedly
+        // immediate add the moment it's turned on. checkOCAutoAddTrigger()
+        // will re-populate this properly the next time OC's edge-detection
+        // sees a fresh ready transition.
+        localStorage.removeItem('tmnOCReadyForAddState');
+        state.ocReadyForAddAt = 0;
+        state.ocAddedThisCycle = false;
+      }
+      saveState();
+      updateStatus('📋 Auto-Add OC Classifieds ' + (state.autoAddOC ? 'Enabled' : 'Disabled'));
     });
 
     // Whitelist toggle and modal
@@ -10240,6 +10399,7 @@ async function mainLoop() {
 
     // Check OC/DTM ready alerts (edge-triggered)
     try { checkOCDTMReadyAlerts(); } catch (e) {}
+    try { checkOCAutoAddTrigger(); } catch (e) {}
 
     // Check health and buy if needed (high priority - runs before other actions)
     if (state.autoHealth && !state.isPerformingAction) {
@@ -10403,6 +10563,46 @@ async function mainLoop() {
           }
         }
 
+        // v17.60 - OC Classifieds Auto-Add. Same "in progress" pause
+        // pattern as bunker/scrapyard above, evaluated only when neither of
+        // those already claimed this tick (same reasoning: at most one
+        // "extra errand" feature navigating/submitting at a time).
+        // Requires isInHotCity() too, per request - not just "not due"
+        // vs "due" now, but also gated on actually being in the hot city.
+        // Deliberately part of the due-check itself (not a post-navigation
+        // wait inside doOCAdsSubmit): if it's folded in here, "not in hot
+        // city yet" makes ocAddDue simply false, so this feature doesn't
+        // navigate anywhere or claim the tick at all - crime/GTA/booze/
+        // jailbreak keep running normally while waiting, instead of
+        // parking on ocads.aspx and blocking everything else until
+        // whatever else in the loop eventually gets you to the hot city.
+        const ocAddDue = state.autoAddOC && state.ocReadyForAddAt > 0 && !state.ocAddedThisCycle &&
+          (now - state.ocReadyForAddAt >= 90000) && isInHotCity();
+        let ocAdsHandledThisTick = false;
+
+        if (!bunkerHandledThisTick && !scrapyardHandledThisTick) {
+          if (state.ocAdsCheckInProgress) {
+            const ocAdsCheckStartedAt = GM_getValue('ocAdsCheckStartedAt', 0);
+            if (ocAdsCheckStartedAt && (now - ocAdsCheckStartedAt > 90000)) {
+              console.warn('[TMN][OCAdsCheck] Stuck in progress for 90s+ - clearing pause and resuming other actions');
+              state.ocAdsCheckInProgress = false;
+              GM_setValue('ocAdsCheckStartedAt', 0);
+              saveState();
+              // Don't set ocAdsHandledThisTick - fall through to normal
+              // crime/GTA/etc handling now that the pause is cleared.
+            } else {
+              doOCAdsSubmit();
+              ocAdsHandledThisTick = true;
+            }
+          } else if (ocAddDue) {
+            state.ocAdsCheckInProgress = true;
+            GM_setValue('ocAdsCheckStartedAt', now);
+            saveState();
+            doOCAdsSubmit();
+            ocAdsHandledThisTick = true;
+          }
+        }
+
         // v17.29 - Travel back to hot city after DTM. Same "in progress"
         // pause pattern as bunker/scrapyard, but the trigger isn't an
         // interval - it's state.pendingTravelBack (set on DTM completion),
@@ -10421,7 +10621,7 @@ async function mainLoop() {
         // same tick, exactly like a DTM-triggered queue would.
         checkHotCitySafetyNet(now);
 
-        if (!bunkerHandledThisTick && !scrapyardHandledThisTick) {
+        if (!bunkerHandledThisTick && !scrapyardHandledThisTick && !ocAdsHandledThisTick) {
           if (state.travelBackInProgress) {
             const travelBackStartedAt = GM_getValue('travelBackStartedAt', 0);
             if (travelBackStartedAt && (now - travelBackStartedAt > 90000)) {
@@ -10499,7 +10699,7 @@ async function mainLoop() {
           }
         }
 
-        if (!bunkerHandledThisTick && !scrapyardHandledThisTick && !travelBackHandledThisTick) {
+        if (!bunkerHandledThisTick && !scrapyardHandledThisTick && !ocAdsHandledThisTick && !travelBackHandledThisTick) {
         // Check if we have a pending action from being jailed
         if (state.pendingAction) {
           updateStatus(`Resuming pending action: ${state.pendingAction}`);
@@ -10721,7 +10921,7 @@ async function mainLoop() {
 
     // Show appropriate status based on tab status
     if (tabManager.isMasterTab) {
-      updateStatus("TMN TDS Auto v17.59 loaded - Master tab (single tab mode)");
+      updateStatus("TMN TDS Auto v17.60 loaded - Master tab (single tab mode)");
     } else {
       updateStatus("⏸ Secondary tab - close this tab or it will remain inactive");
     }
